@@ -1,0 +1,142 @@
+# Conductor VM Testing Configuration
+# ===================================
+
+# VM Settings
+vms:
+  # Number of VMs per version
+  count_per_version: 5
+  
+  # VM name prefix (will be suffixed with distro-version-number, e.g., conductor-test-fedora-42-1)
+  name_prefix: "conductor-test"
+  
+  # Resources per VM
+  memory_mb: 2048
+  vcpus: 2
+  disk_size_gb: 15
+  
+  # Default distribution to use (if not specified via command line)
+  default_distribution: "fedora"
+  
+  # Default versions to create (if not specified via command line)
+  # Format: "distro:version" or just "version" (uses default_distribution)
+  default_versions: ["fedora:42"]
+  
+  # Available distributions and their versions
+  distributions:
+    fedora:
+      # Available Fedora versions to test
+      # Format: version: display_name
+      available_versions:
+        42: "Fedora 42 (Current)"
+        41: "Fedora 41"
+        40: "Fedora 40 (may be archived)"
+        39: "Fedora 39 (may be archived)"
+        38: "Fedora 38 (may be archived)"
+        37: "Fedora 37 (archived)"
+        36: "Fedora 36 (archived)"
+        35: "Fedora 35 (archived)"
+        34: "Fedora 34 (archived)"
+        33: "Fedora 33 (may not be available)"
+      default_version: 42
+    
+    debian:
+      # Available Debian versions to test
+      available_versions:
+        "12": "Debian 12 (Bookworm)"
+        "11": "Debian 11 (Bullseye)"
+        "10": "Debian 10 (Buster)"
+        "9": "Debian 9 (Stretch)"
+      default_version: "12"
+    
+    ubuntu:
+      # Available Ubuntu versions to test
+      available_versions:
+        "24.04": "Ubuntu 24.04 LTS (Noble Numbat)"
+        "22.04": "Ubuntu 22.04 LTS (Jammy Jellyfish)"
+        "20.04": "Ubuntu 20.04 LTS (Focal Fossa)"
+        "18.04": "Ubuntu 18.04 LTS (Bionic Beaver)"
+      default_version: "24.04"
+    
+    centos:
+      # Available CentOS versions to test
+      available_versions:
+        "9": "CentOS Stream 9"
+        "8": "CentOS Stream 8"
+        "7": "CentOS 7 (EOL)"
+      default_version: "9"
+    
+    rhel:
+      # Available RHEL versions to test
+      # Supports both major (10, 9, 8, 7) and minor (10.1, 10.0, 9.4, 9.3, 8.10, etc.) releases
+      # Note: RHEL cloud images may require Red Hat subscription to download
+      available_versions:
+        "10.1": "RHEL 10.1"
+        "10.0": "RHEL 10.0"
+        "10": "RHEL 10 (latest)"
+        "9.5": "RHEL 9.5"
+        "9.4": "RHEL 9.4"
+        "9.3": "RHEL 9.3"
+        "9.2": "RHEL 9.2"
+        "9.1": "RHEL 9.1"
+        "9.0": "RHEL 9.0"
+        "9": "RHEL 9 (latest)"
+        "8.11": "RHEL 8.11"
+        "8.10": "RHEL 8.10"
+        "8.9": "RHEL 8.9"
+        "8.8": "RHEL 8.8"
+        "8.7": "RHEL 8.7"
+        "8.6": "RHEL 8.6"
+        "8.5": "RHEL 8.5"
+        "8.4": "RHEL 8.4"
+        "8.3": "RHEL 8.3"
+        "8.2": "RHEL 8.2"
+        "8.1": "RHEL 8.1"
+        "8.0": "RHEL 8.0"
+        "8": "RHEL 8 (latest)"
+        "7.9": "RHEL 7.9"
+        "7.8": "RHEL 7.8"
+        "7.7": "RHEL 7.7"
+        "7.6": "RHEL 7.6"
+        "7.5": "RHEL 7.5"
+        "7.4": "RHEL 7.4"
+        "7.3": "RHEL 7.3"
+        "7.2": "RHEL 7.2"
+        "7.1": "RHEL 7.1"
+        "7.0": "RHEL 7.0"
+        "7": "RHEL 7 (latest)"
+      default_version: "10.1"
+    
+    suse:
+      # Available SUSE versions to test
+      # Supports openSUSE Leap (free) and SUSE Linux Enterprise Server (SLES, requires subscription)
+      available_versions:
+        "15.5": "openSUSE Leap 15.5"
+        "15.4": "openSUSE Leap 15.4"
+        "15.3": "openSUSE Leap 15.3"
+        "15.2": "openSUSE Leap 15.2"
+        "tumbleweed": "openSUSE Tumbleweed (rolling)"
+        "sles15.5": "SUSE Linux Enterprise Server 15.5 (requires subscription)"
+        "sles15.4": "SUSE Linux Enterprise Server 15.4 (requires subscription)"
+        "sles15.3": "SUSE Linux Enterprise Server 15.3 (requires subscription)"
+      default_version: "15.5"
+  
+  # User credentials for VMs
+  username: "conductor"
+  password: "conductortest123"
+  
+  # SSH key path (optional, will be generated if not exists)
+  ssh_key_path: "~/.ssh/conductor-test-key"
+
+# Network Settings
+network:
+  # libvirt network to use
+  name: "default"
+
+# Host Settings
+host:
+  # Path to store VM images (all images are in this directory)
+  image_dir: "/var/lib/libvirt/images"
+  
+  # Path to store cloud-init ISOs
+  cloudinit_dir: "/tmp/conductor-test-cloudinit"
+
