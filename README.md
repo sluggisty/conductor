@@ -44,7 +44,7 @@ The script needs to check for base images in `/var/lib/libvirt/images`. If you g
 
 ## Quick Start
 
-### List Available Versions
+### 1. List Available Versions
 
 ```bash
 # List all available distributions and versions, showing which base images are available
@@ -63,6 +63,45 @@ The `--scan` option will:
 - Automatically detect available images in the image directory
 - Parse image filenames to extract distribution and version information
 - Display detected images in a table format
+
+### 2. Create Test VMs
+
+```bash
+# Create 5 VMs for Fedora 42 (default)
+./conductor.py create
+
+# Create VMs for multiple Fedora versions
+./conductor.py create --specs fedora:42,41,40
+
+# Create RHEL VMs
+./conductor.py create --specs rhel:10.0,9.4
+
+# Create Ubuntu VMs
+./conductor.py create --specs ubuntu:24.04,22.04
+
+# Create mixed distribution VMs
+./conductor.py create --specs fedora:42,debian:12,ubuntu:24.04,rhel:10.0
+
+# Create 3 VMs per version with custom resources
+./conductor.py create --specs fedora:42,41 --count 3 --memory 1024 --cpus 1
+
+# Create one VM for each distribution that has available base images
+# Only creates VMs for distributions/versions that actually have images downloaded
+./conductor.py create-all
+
+# Create one VM per distribution with custom resources
+./conductor.py create-all --memory 1024 --cpus 1
+```
+
+### 3. Check VM Status
+
+```bash
+# Show all VMs
+./conductor.py status
+
+# Show as JSON
+./conductor.py status --json
+```
 
 ## Supported Distributions
 
@@ -100,10 +139,28 @@ Edit `config.yaml` to customize:
 
 ## Command Reference
 
+### List Versions
+
 | Command | Description |
 |---------|-------------|
 | `./conductor.py list-versions` | List available distributions and versions with base image status |
 | `./conductor.py list-versions --scan` | Scan image directory and auto-detect available images |
+| `./conductor.py list-versions --debug` | Show debug information about file checks |
+
+### VM Management
+
+| Command | Description |
+|---------|-------------|
+| `./conductor.py create` | Create test VMs (default: 5 VMs for Fedora 42) |
+| `./conductor.py create --specs fedora:42,41` | Create VMs for specific Fedora versions |
+| `./conductor.py create --specs rhel:10.0,9.4` | Create VMs for specific RHEL versions |
+| `./conductor.py create --specs ubuntu:24.04,22.04` | Create VMs for specific Ubuntu versions |
+| `./conductor.py create --count 3` | Create 3 VMs per version (default: 5) |
+| `./conductor.py create --memory 1024 --cpus 1` | Customize VM resources |
+| `./conductor.py create-all` | Create one VM for each distribution that has available base images |
+| `./conductor.py create-all --memory 1024 --cpus 1` | Customize VM resources for create-all |
+| `./conductor.py status` | Show status of all test VMs |
+| `./conductor.py status --json` | Show VM status as JSON |
 
 ## Directory Structure
 
