@@ -17,7 +17,7 @@ from rich.table import Table
 from conductor.config import SCRIPTS_DIR, load_config
 from conductor.images import check_image_exists, get_base_image_path, scan_available_images
 from conductor.utils import run_command
-from conductor.vms import get_available_distro_versions, get_running_vms, get_vm_ip, get_vm_list
+from conductor.vms import get_available_distro_versions, get_running_vms, get_stopped_vms, get_vm_ip, get_vm_list
 
 console = Console()
 
@@ -635,3 +635,378 @@ def run_snail_on_vms(
         console.print(f"[red]✗ {failed_count} VM(s) failed or timed out[/]")
     
     console.print()
+
+
+def destroy_vms(
+    force: bool,
+    vm_name: str | None
+) -> None:
+    """
+    Destroy (shutdown and remove) VMs.
+    
+    Args:
+        force: Skip confirmation prompt
+        vm_name: Specific VM name to destroy, or None for all VMs
+    """
+    console.print(Panel.fit(
+        "[bold red]Destroying VMs[/]",
+        border_style="red"
+    ))
+    
+    config = load_config()
+    vms_config = config.get("vms", {})
+    host_config = config.get("host", {})
+    vm_prefix = vms_config.get("name_prefix", "conductor-test")
+    image_dir = host_config.get("image_dir", "/var/lib/libvirt/images")
+    cloudinit_dir = host_config.get("cloudinit_dir", "/tmp/conductor-test-cloudinit")
+    
+    # Handle specific VM
+    if vm_name:
+        # Check if VM exists
+        result = run_command(
+            ["virsh", "list", "--all", "--name"],
+            sudo=True,
+            check=False
+        )
+        
+        if vm_name not in result.stdout:
+            console.print(f"[red]VM not found: {vm_name}[/]")
+            sys.exit(1)
+        
+        if not force:
+            if not click.confirm(f"Are you sure you want to destroy {vm_name}?"):
+                console.print("[yellow]Aborted[/]")
+                return
+        
+        _destroy_single_vm(vm_name, image_dir)
+        console.print(f"\n[green]✓ VM {vm_name} destroyed[/]")
+        return
+    
+    # Get all conductor-test VMs
+    vms = get_vm_list()
+    
+    if not vms:
+        console.print(f"[yellow]No VMs found with prefix: {vm_prefix}[/]")
+        return
+    
+    console.print(f"\n[dim]Found {len(vms)} VM(s) to destroy:[/]")
+    for vm in vms:
+        console.print(f"  - {vm}")
+    console.print()
+    
+    if not force:
+        if not click.confirm(f"Are you sure you want to destroy ALL {len(vms)} VM(s)?"):
+            console.print("[yellow]Aborted[/]")
+            return
+    
+    # Destroy each VM
+    console.print()
+    for vm in vms:
+        _destroy_single_vm(vm, image_dir)
+    
+    # Clean up cloud-init directory
+    cloudinit_path = Path(cloudinit_dir)
+    if cloudinit_path.exists():
+        console.print(f"\n[dim]Cleaning up cloud-init directory...[/]")
+        import shutil
+        try:
+            shutil.rmtree(cloudinit_path)
+            console.print(f"[green]✓[/] Removed {cloudinit_dir}")
+        except Exception as e:
+            console.print(f"[yellow]⚠[/] Failed to remove cloud-init directory: {e}")
+    
+    # Remove VM list file if it exists
+    vm_list_file = Path(__file__).parent.parent / "vm-list.txt"
+    if vm_list_file.exists():
+        try:
+            vm_list_file.unlink()
+            console.print(f"[green]✓[/] Removed vm-list.txt")
+        except Exception as e:
+            console.print(f"[yellow]⚠[/] Failed to remove vm-list.txt: {e}")
+    
+    console.print(f"\n[green]✓ All {len(vms)} VM(s) have been destroyed![/]")
+
+
+def shutdown_vms(
+    force: bool,
+    vm_name: str | None
+) -> None:
+    """
+    Shutdown (stop) VMs without deleting them.
+    
+    Args:
+        force: Skip confirmation prompt
+        vm_name: Specific VM name to shutdown, or None for all VMs
+    """
+    console.print(Panel.fit(
+        "[bold yellow]Shutting Down VMs[/]",
+        border_style="yellow"
+    ))
+    
+    config = load_config()
+    vms_config = config.get("vms", {})
+    vm_prefix = vms_config.get("name_prefix", "conductor-test")
+    
+    # Handle specific VM
+    if vm_name:
+        # Check if VM exists
+        result = run_command(
+            ["virsh", "list", "--all", "--name"],
+            sudo=True,
+            check=False
+        )
+        
+        if vm_name not in result.stdout:
+            console.print(f"[red]VM not found: {vm_name}[/]")
+            sys.exit(1)
+        
+        # Check if VM is running
+        state_result = run_command(
+            ["virsh", "domstate", vm_name],
+            sudo=True,
+            check=False
+        )
+        
+        state = state_result.stdout.strip() if state_result.returncode == 0 else "unknown"
+        
+        if state != "running":
+            console.print(f"[yellow]VM {vm_name} is not running (state: {state})[/]")
+            return
+        
+        if not force:
+            if not click.confirm(f"Are you sure you want to shutdown {vm_name}?"):
+                console.print("[yellow]Aborted[/]")
+                return
+        
+        _shutdown_single_vm(vm_name)
+        console.print(f"\n[green]✓ VM {vm_name} shutdown[/]")
+        return
+    
+    # Get all running VMs
+    running_vms = get_running_vms()
+    
+    if not running_vms:
+        console.print(f"[yellow]No running VMs found with prefix: {vm_prefix}[/]")
+        return
+    
+    console.print(f"\n[dim]Found {len(running_vms)} running VM(s) to shutdown:[/]")
+    for vm in running_vms:
+        console.print(f"  - {vm}")
+    console.print()
+    
+    if not force:
+        if not click.confirm(f"Are you sure you want to shutdown ALL {len(running_vms)} VM(s)?"):
+            console.print("[yellow]Aborted[/]")
+            return
+    
+    # Shutdown each VM
+    console.print()
+    for vm in running_vms:
+        _shutdown_single_vm(vm)
+    
+    console.print(f"\n[green]✓ All {len(running_vms)} VM(s) have been shutdown![/]")
+
+
+def _shutdown_single_vm(vm_name: str) -> None:
+    """
+    Shutdown a single VM gracefully.
+    
+    Args:
+        vm_name: Name of the VM to shutdown
+    """
+    console.print(f"[cyan]Shutting down {vm_name}...[/]")
+    
+    # Try graceful shutdown first
+    console.print(f"  [dim]Sending shutdown signal...[/]")
+    result = run_command(
+        ["virsh", "shutdown", vm_name],
+        sudo=True,
+        check=False
+    )
+    
+    if result.returncode == 0:
+        # Wait a bit for graceful shutdown
+        import time
+        time.sleep(2)
+        
+        # Check if still running
+        state_result = run_command(
+            ["virsh", "domstate", vm_name],
+            sudo=True,
+            check=False
+        )
+        
+        state = state_result.stdout.strip() if state_result.returncode == 0 else "unknown"
+        
+        if state == "running":
+            console.print(f"  [dim]VM still running, forcing shutdown...[/]")
+            run_command(
+                ["virsh", "destroy", vm_name],
+                sudo=True,
+                check=False
+            )
+            console.print(f"  [green]✓[/] {vm_name} forced shutdown")
+        else:
+            console.print(f"  [green]✓[/] {vm_name} shutdown gracefully")
+    else:
+        # If shutdown fails, try destroy as fallback
+        console.print(f"  [dim]Shutdown command failed, forcing...[/]")
+        run_command(
+            ["virsh", "destroy", vm_name],
+            sudo=True,
+            check=False
+        )
+        console.print(f"  [green]✓[/] {vm_name} forced shutdown")
+
+
+def start_vms(
+    force: bool,
+    vm_name: str | None
+) -> None:
+    """
+    Start stopped VMs.
+    
+    Args:
+        force: Skip confirmation prompt
+        vm_name: Specific VM name to start, or None for all stopped VMs
+    """
+    console.print(Panel.fit(
+        "[bold green]Starting VMs[/]",
+        border_style="green"
+    ))
+    
+    config = load_config()
+    vms_config = config.get("vms", {})
+    vm_prefix = vms_config.get("name_prefix", "conductor-test")
+    
+    # Handle specific VM
+    if vm_name:
+        # Check if VM exists
+        result = run_command(
+            ["virsh", "list", "--all", "--name"],
+            sudo=True,
+            check=False
+        )
+        
+        if vm_name not in result.stdout:
+            console.print(f"[red]VM not found: {vm_name}[/]")
+            sys.exit(1)
+        
+        # Check if VM is already running
+        state_result = run_command(
+            ["virsh", "domstate", vm_name],
+            sudo=True,
+            check=False
+        )
+        
+        state = state_result.stdout.strip() if state_result.returncode == 0 else "unknown"
+        
+        if state == "running":
+            console.print(f"[yellow]VM {vm_name} is already running[/]")
+            return
+        
+        if not force:
+            if not click.confirm(f"Are you sure you want to start {vm_name}?"):
+                console.print("[yellow]Aborted[/]")
+                return
+        
+        _start_single_vm(vm_name)
+        console.print(f"\n[green]✓ VM {vm_name} started[/]")
+        return
+    
+    # Get all stopped VMs
+    stopped_vms = get_stopped_vms()
+    
+    if not stopped_vms:
+        console.print(f"[yellow]No stopped VMs found with prefix: {vm_prefix}[/]")
+        return
+    
+    console.print(f"\n[dim]Found {len(stopped_vms)} stopped VM(s) to start:[/]")
+    for vm in stopped_vms:
+        console.print(f"  - {vm}")
+    console.print()
+    
+    if not force:
+        if not click.confirm(f"Are you sure you want to start ALL {len(stopped_vms)} VM(s)?"):
+            console.print("[yellow]Aborted[/]")
+            return
+    
+    # Start each VM
+    console.print()
+    for vm in stopped_vms:
+        _start_single_vm(vm)
+    
+    console.print(f"\n[green]✓ All {len(stopped_vms)} VM(s) have been started![/]")
+
+
+def _start_single_vm(vm_name: str) -> None:
+    """
+    Start a single VM.
+    
+    Args:
+        vm_name: Name of the VM to start
+    """
+    console.print(f"[cyan]Starting {vm_name}...[/]")
+    
+    result = run_command(
+        ["virsh", "start", vm_name],
+        sudo=True,
+        check=False
+    )
+    
+    if result.returncode == 0:
+        console.print(f"  [green]✓[/] {vm_name} started")
+    else:
+        console.print(f"  [red]✗[/] {vm_name} failed to start")
+        if result.stderr:
+            console.print(f"  [dim]Error: {result.stderr[:200]}[/]")
+
+
+def _destroy_single_vm(vm_name: str, image_dir: str) -> None:
+    """
+    Destroy a single VM.
+    
+    Args:
+        vm_name: Name of the VM to destroy
+        image_dir: Directory where VM disk images are stored
+    """
+    console.print(f"[cyan]Destroying {vm_name}...[/]")
+    
+    # Check if VM is running
+    result = run_command(
+        ["virsh", "domstate", vm_name],
+        sudo=True,
+        check=False
+    )
+    
+    state = result.stdout.strip() if result.returncode == 0 else "unknown"
+    
+    if state == "running":
+        console.print(f"  [dim]Stopping VM...[/]")
+        run_command(
+            ["virsh", "destroy", vm_name],
+            sudo=True,
+            check=False
+        )
+    
+    # Undefine VM and remove storage
+    console.print(f"  [dim]Removing VM definition and storage...[/]")
+    run_command(
+        ["virsh", "undefine", vm_name, "--remove-all-storage"],
+        sudo=True,
+        check=False
+    )
+    
+    # Clean up any remaining disk images
+    disk_path = Path(image_dir) / f"{vm_name}.qcow2"
+    if disk_path.exists():
+        try:
+            run_command(
+                ["rm", "-f", str(disk_path)],
+                sudo=True,
+                check=False
+            )
+        except Exception:
+            pass  # Ignore errors if file doesn't exist
+    
+    console.print(f"  [green]✓[/] {vm_name} destroyed")

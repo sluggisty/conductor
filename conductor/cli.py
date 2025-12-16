@@ -10,9 +10,12 @@ from conductor import __version__
 from conductor.commands import (
     create_all_vms,
     create_vms,
+    destroy_vms,
     list_versions,
     run_snail_on_vms,
+    shutdown_vms,
     show_status,
+    start_vms,
 )
 
 
@@ -129,5 +132,50 @@ def create_all(memory: int, cpus: int):
 def run_snail(parallel: bool, timeout: int, upload_url: str | None):
     """Run snail-core on all running VMs."""
     run_snail_on_vms(parallel, timeout, upload_url)
+
+
+@cli.command("start")
+@click.option(
+    "--force", "-f",
+    is_flag=True,
+    help="Don't ask for confirmation"
+)
+@click.option(
+    "--vm",
+    help="Start specific VM by name"
+)
+def start(force: bool, vm: str | None):
+    """Start stopped VMs."""
+    start_vms(force, vm)
+
+
+@cli.command("shutdown")
+@click.option(
+    "--force", "-f",
+    is_flag=True,
+    help="Don't ask for confirmation"
+)
+@click.option(
+    "--vm",
+    help="Shutdown specific VM by name"
+)
+def shutdown(force: bool, vm: str | None):
+    """Shutdown (stop) VMs without deleting them."""
+    shutdown_vms(force, vm)
+
+
+@cli.command("destroy")
+@click.option(
+    "--force", "-f",
+    is_flag=True,
+    help="Don't ask for confirmation"
+)
+@click.option(
+    "--vm",
+    help="Destroy specific VM by name"
+)
+def destroy(force: bool, vm: str | None):
+    """Destroy (shutdown and remove) VMs."""
+    destroy_vms(force, vm)
 
 

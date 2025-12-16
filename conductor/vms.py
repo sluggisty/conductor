@@ -214,6 +214,39 @@ def get_running_vms() -> list[str]:
     return sorted(vms)
 
 
+def get_stopped_vms() -> list[str]:
+    """
+    Get list of stopped (shutdown) conductor-test VMs.
+    
+    Returns:
+        List of stopped VM names
+    """
+    config = load_config()
+    prefix = config.get("vms", {}).get("name_prefix", "conductor-test")
+    
+    # Get all VMs (running and stopped)
+    all_vms_result = run_command(
+        ["virsh", "list", "--all", "--name"],
+        sudo=True,
+        check=False
+    )
+    
+    if all_vms_result.returncode != 0:
+        return []
+    
+    # Get running VMs
+    running_vms = set(get_running_vms())
+    
+    # Find stopped VMs (all VMs minus running ones)
+    stopped_vms = []
+    for line in all_vms_result.stdout.strip().split("\n"):
+        line = line.strip()
+        if line and line.startswith(prefix) and line not in running_vms:
+            stopped_vms.append(line)
+    
+    return sorted(stopped_vms)
+
+
 def get_vm_ip(vm_name: str) -> str | None:
     """
     Get the IP address of a VM.

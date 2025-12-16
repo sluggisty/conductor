@@ -7,7 +7,9 @@ VM management and testing tool for managing Linux distribution VMs.
 Conductor provides tools to:
 - List available distributions and their versions
 - Check for base images in `/var/lib/libvirt/images`
-- Manage VMs across multiple Linux distributions
+- Create and manage VMs across multiple Linux distributions
+- Start, stop, and destroy VMs
+- Run snail-core on running VMs to collect system information
 
 ## Prerequisites
 
@@ -103,6 +105,75 @@ The `--scan` option will:
 ./conductor.py status --json
 ```
 
+### 4. Start VMs
+
+Start stopped (shutdown) VMs:
+
+```bash
+# Start all stopped VMs
+./conductor.py start
+
+# Start a specific VM
+./conductor.py start --vm conductor-test-fedora-42-1
+
+# Start without confirmation prompt
+./conductor.py start --force
+```
+
+### 5. Shutdown VMs
+
+Stop running VMs without deleting them (VMs can be started again later):
+
+```bash
+# Shutdown all running VMs
+./conductor.py shutdown
+
+# Shutdown a specific VM
+./conductor.py shutdown --vm conductor-test-fedora-42-1
+
+# Shutdown without confirmation prompt
+./conductor.py shutdown --force
+```
+
+### 6. Destroy VMs
+
+Permanently remove VMs (stops them, removes VM definitions, and deletes storage):
+
+```bash
+# Destroy all VMs (with confirmation)
+./conductor.py destroy
+
+# Destroy a specific VM
+./conductor.py destroy --vm conductor-test-fedora-42-1
+
+# Destroy without confirmation prompt
+./conductor.py destroy --force
+```
+
+**Warning**: The `destroy` command permanently removes VMs and all their data. Use `shutdown` if you want to stop VMs temporarily.
+
+### 7. Run Snail-Core on VMs
+
+Execute `snail-core run` on all running VMs:
+
+```bash
+# Run snail-core on all running VMs
+./conductor.py run-snail
+
+# Run with custom upload URL
+./conductor.py run-snail --upload-url http://localhost:8080/api/v1/ingest
+
+# Run with custom timeout
+./conductor.py run-snail --timeout 600
+```
+
+This command will:
+1. Find all running conductor-test VMs
+2. Get their IP addresses
+3. SSH into each VM and run `/opt/snail-core/venv/bin/snail run`
+4. Display results for each VM
+5. Show a summary of successes and failures
+
 ## Supported Distributions
 
 - **Fedora**: versions 42, 41, 40, 39, 38, 37, 36, 35, 34, 33
@@ -161,6 +232,53 @@ Edit `config.yaml` to customize:
 | `./conductor.py create-all --memory 1024 --cpus 1` | Customize VM resources for create-all |
 | `./conductor.py status` | Show status of all test VMs |
 | `./conductor.py status --json` | Show VM status as JSON |
+| `./conductor.py start` | Start all stopped VMs |
+| `./conductor.py start --vm NAME` | Start a specific VM by name |
+| `./conductor.py start --force` | Start VMs without confirmation |
+| `./conductor.py shutdown` | Shutdown (stop) all running VMs without deleting them |
+| `./conductor.py shutdown --vm NAME` | Shutdown a specific VM |
+| `./conductor.py shutdown --force` | Shutdown VMs without confirmation |
+| `./conductor.py destroy` | Permanently destroy (remove) all VMs |
+| `./conductor.py destroy --vm NAME` | Destroy a specific VM |
+| `./conductor.py destroy --force` | Destroy VMs without confirmation |
+| `./conductor.py run-snail` | Run snail-core on all running VMs |
+| `./conductor.py run-snail --upload-url URL` | Run snail-core with custom upload URL |
+| `./conductor.py run-snail --timeout SECONDS` | Set SSH command timeout (default: 300) |
+
+## VM Lifecycle
+
+Conductor provides a complete VM lifecycle management:
+
+1. **Create**: Create new VMs from base images
+2. **Start**: Start stopped VMs
+3. **Shutdown**: Stop running VMs (keeps VM definitions and storage)
+4. **Destroy**: Permanently remove VMs (deletes everything)
+5. **Run Snail-Core**: Execute snail-core on running VMs to collect system data
+
+### Workflow Example
+
+```bash
+# 1. List available distributions
+./conductor.py list-versions
+
+# 2. Create VMs
+./conductor.py create-all
+
+# 3. Check status
+./conductor.py status
+
+# 4. Run snail-core on all running VMs
+./conductor.py run-snail --upload-url http://localhost:8080/api/v1/ingest
+
+# 5. Shutdown VMs when done (keeps them for later)
+./conductor.py shutdown
+
+# 6. Start VMs again later
+./conductor.py start
+
+# 7. Destroy VMs when no longer needed
+./conductor.py destroy
+```
 
 ## Directory Structure
 
@@ -169,7 +287,29 @@ conductor/
 ├── README.md           # This file
 ├── config.yaml         # Configuration file
 ├── requirements.txt    # Python dependencies
-└── conductor.py       # Main CLI tool
+├── conductor.py        # Main CLI tool
+└── conductor/          # Python package
+    ├── __init__.py
+    ├── cli.py          # CLI command definitions
+    ├── commands.py      # Command implementations
+    ├── config.py        # Configuration loading
+    ├── images.py        # Image management
+    ├── utils.py         # Utility functions
+    └── vms.py           # VM management functions
+└── scripts/            # Shell scripts
+    ├── create-vms.sh   # VM creation script
+    └── lib/            # Script library modules
+        ├── common.sh    # Common functions
+        ├── images.sh    # Image functions
+        ├── vm.sh        # VM functions
+        └── cloudinit/   # Cloud-init generators
+            ├── base.sh
+            ├── fedora.sh
+            ├── debian.sh
+            ├── ubuntu.sh
+            ├── centos.sh
+            ├── rhel.sh
+            └── suse.sh
 ```
 
 ## License
