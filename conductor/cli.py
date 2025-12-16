@@ -11,6 +11,7 @@ from conductor.commands import (
     create_all_vms,
     create_vms,
     list_versions,
+    run_snail_on_vms,
     show_status,
 )
 
@@ -108,4 +109,25 @@ def status(as_json: bool):
 def create_all(memory: int, cpus: int):
     """Create one VM for each distribution that has available base images."""
     create_all_vms(memory, cpus)
+
+
+@cli.command("run-snail")
+@click.option(
+    "--parallel", "-p",
+    is_flag=True,
+    help="Run commands in parallel (not yet implemented)"
+)
+@click.option(
+    "--timeout", "-t",
+    default=300,
+    help="SSH command timeout in seconds (default: 300)"
+)
+@click.option(
+    "--upload-url", "-u",
+    help="Upload URL for snail-core to send data to (optional)"
+)
+def run_snail(parallel: bool, timeout: int, upload_url: str | None):
+    """Run snail-core on all running VMs."""
+    run_snail_on_vms(parallel, timeout, upload_url)
+
 

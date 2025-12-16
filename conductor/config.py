@@ -27,3 +27,4 @@ def load_config() -> dict[str, Any]:
             return yaml.safe_load(f)
     return {}
 
+

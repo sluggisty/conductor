@@ -5,6 +5,7 @@ Contains all the Click command handlers for the Conductor CLI.
 """
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from rich.table import Table
 from conductor.config import SCRIPTS_DIR, load_config
 from conductor.images import check_image_exists, get_base_image_path, scan_available_images
 from conductor.utils import run_command
-from conductor.vms import get_available_distro_versions, get_vm_list
+from conductor.vms import get_available_distro_versions, get_running_vms, get_vm_ip, get_vm_list
 
 console = Console()
 
@@ -522,3 +523,115 @@ def create_all_vms(memory: int, cpus: int) -> None:
         console.print("[red]Failed to create VMs[/]")
         sys.exit(1)
 
+
+def run_snail_on_vms(
+    parallel: bool,
+    timeout: int,
+    upload_url: str | None
+) -> None:
+    """
+    Run snail-core on all running VMs.
+    
+    Args:
+        parallel: Whether to run commands in parallel
+        timeout: SSH command timeout in seconds
+        upload_url: Optional upload URL to pass to snail-core
+    """
+    console.print(Panel.fit(
+        "[bold blue]Running snail-core on VMs[/]",
+        border_style="blue"
+    ))
+    
+    config = load_config()
+    vms_config = config.get("vms", {})
+    vm_user = vms_config.get("username", "conductor")
+    ssh_key_default = "~/.ssh/conductor-test-key"
+    ssh_key_path = os.path.expanduser(
+        vms_config.get("ssh_key_path", ssh_key_default)
+    )
+    
+    # Get running VMs
+    running_vms = get_running_vms()
+    
+    if not running_vms:
+        console.print("[yellow]No running VMs found[/]")
+        return
+    
+    console.print(f"\n[dim]Found {len(running_vms)} running VM(s)[/]\n")
+    
+    # Get IP addresses for all VMs
+    vm_ips = {}
+    console.print("[dim]Getting IP addresses...[/]")
+    for vm_name in running_vms:
+        ip = get_vm_ip(vm_name)
+        if ip:
+            vm_ips[vm_name] = ip
+            console.print(f"[green]✓[/] {vm_name}: {ip}")
+        else:
+            console.print(f"[yellow]⚠[/] {vm_name}: No IP address found")
+    
+    if not vm_ips:
+        console.print("[red]No VMs with IP addresses found[/]")
+        return
+    
+    console.print(f"\n[dim]Running snail-core on {len(vm_ips)} VM(s)...[/]\n")
+    
+    # Build SSH command
+    ssh_cmd_base = [
+        "ssh",
+        "-i", ssh_key_path,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10",
+        "-o", f"ServerAliveInterval={timeout // 3}",
+    ]
+    
+    # Build snail-core command
+    snail_cmd = "/opt/snail-core/venv/bin/snail run"
+    if upload_url:
+        snail_cmd = f"SNAIL_API_ENDPOINT={upload_url} {snail_cmd}"
+    
+    # Run on each VM
+    results = {}
+    for vm_name, ip in vm_ips.items():
+        console.print(f"[cyan]Running on {vm_name} ({ip})...[/]")
+        
+        ssh_cmd = ssh_cmd_base + [
+            f"{vm_user}@{ip}",
+            snail_cmd
+        ]
+        
+        try:
+            result = run_command(
+                ssh_cmd,
+                capture=True,
+                check=False,
+                timeout=timeout
+            )
+            
+            if result.returncode == 0:
+                console.print(f"[green]✓[/] {vm_name}: Success")
+                results[vm_name] = ("success", result.stdout)
+            else:
+                console.print(f"[red]✗[/] {vm_name}: Failed (exit code {result.returncode})")
+                if result.stderr:
+                    console.print(f"[dim]Error: {result.stderr[:200]}[/]")
+                results[vm_name] = ("failed", result.stderr)
+        except subprocess.TimeoutExpired:
+            console.print(f"[yellow]⚠[/] {vm_name}: Timeout after {timeout}s")
+            results[vm_name] = ("timeout", None)
+        except Exception as e:
+            console.print(f"[red]✗[/] {vm_name}: Error - {e}")
+            results[vm_name] = ("error", str(e))
+    
+    # Summary
+    console.print()
+    success_count = sum(1 for status, _ in results.values() if status == "success")
+    failed_count = len(results) - success_count
+    
+    if success_count > 0:
+        console.print(f"[green]✓ {success_count} VM(s) completed successfully[/]")
+    if failed_count > 0:
+        console.print(f"[red]✗ {failed_count} VM(s) failed or timed out[/]")
+    
+    console.print()

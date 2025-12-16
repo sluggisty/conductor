@@ -185,3 +185,62 @@ def _check_distro_version_image(
         return False
     return check_image_exists(base_image)
 
+
+def get_running_vms() -> list[str]:
+    """
+    Get list of running conductor-test VMs.
+    
+    Returns:
+        List of running VM names
+    """
+    config = load_config()
+    prefix = config.get("vms", {}).get("name_prefix", "conductor-test")
+    
+    result = run_command(
+        ["virsh", "list", "--name"],
+        sudo=True,
+        check=False
+    )
+    
+    if result.returncode != 0:
+        return []
+    
+    vms = []
+    for line in result.stdout.strip().split("\n"):
+        line = line.strip()
+        if line and line.startswith(prefix):
+            vms.append(line)
+    
+    return sorted(vms)
+
+
+def get_vm_ip(vm_name: str) -> str | None:
+    """
+    Get the IP address of a VM.
+    
+    Args:
+        vm_name: Name of the VM
+    
+    Returns:
+        IP address as string, or None if not found
+    """
+    result = run_command(
+        ["virsh", "domifaddr", vm_name],
+        sudo=True,
+        check=False
+    )
+    
+    if result.returncode != 0:
+        return None
+    
+    # Extract IP address from output
+    # Format: "  vnet0     52:54:00:12:34:56    ipv4      192.168.124.10/24"
+    import re
+    ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
+    matches = re.findall(ip_pattern, result.stdout)
+    if matches:
+        return matches[0]
+    
+    return None
+
+
