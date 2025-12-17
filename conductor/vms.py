@@ -277,3 +277,62 @@ def get_vm_ip(vm_name: str) -> str | None:
     return None
 
 
+def check_cloud_init_complete(vm_name: str, ip: str, ssh_key_path: str, vm_user: str) -> bool:
+    """
+    Check if cloud-init has completed on a VM by testing SSH connectivity.
+    
+    Args:
+        vm_name: Name of the VM
+        ip: IP address of the VM
+        ssh_key_path: Path to SSH private key
+        vm_user: Username for SSH
+    
+    Returns:
+        True if cloud-init appears complete (SSH works), False otherwise
+    """
+    # Try a simple SSH command to check if key is authorized
+    # This is a good indicator that cloud-init has finished
+    test_cmd = [
+        "ssh",
+        "-i", ssh_key_path,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=3",
+        "-o", "BatchMode=yes",
+        "-o", "PasswordAuthentication=no",
+        "-o", "PubkeyAuthentication=yes",
+        "-q",  # Quiet mode
+        f"{vm_user}@{ip}",
+        "test -f /var/lib/cloud/instance/boot-finished && echo 'ready' || echo 'not-ready'"
+    ]
+    
+    result = run_command(test_cmd, capture=True, check=False, timeout=5)
+    
+    if result.returncode == 0 and "ready" in result.stdout:
+        return True
+    
+    return False
+
+
+def get_vm_state(vm_name: str) -> str:
+    """
+    Get the current state of a VM (running, shut off, etc.).
+    
+    Args:
+        vm_name: Name of the VM
+    
+    Returns:
+        VM state as string, or "unknown" if not found
+    """
+    result = run_command(
+        ["virsh", "domstate", vm_name],
+        sudo=True,
+        check=False
+    )
+    
+    if result.returncode == 0:
+        return result.stdout.strip()
+    
+    return "unknown"
+
+

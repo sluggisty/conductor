@@ -40,7 +40,7 @@ create_vm() {
     log_info "Creating cloud-init configuration..."
     local cloudinit_iso
     create_cloud_init "$vm_name" "$vm_number" "$distro" "$version"
-    cloudinit_iso=$(create_cloud_init_iso "${CLOUDINIT_DIR}/${vm_name}")
+    cloudinit_iso=$(create_cloud_init_iso "$vm_name")
     
     # Determine OS variant
     local os_variant="generic"
