@@ -17,7 +17,15 @@ from rich.table import Table
 from conductor.config import SCRIPTS_DIR, load_config
 from conductor.images import check_image_exists, get_base_image_path, scan_available_images
 from conductor.utils import run_command
-from conductor.vms import get_available_distro_versions, get_running_vms, get_stopped_vms, get_vm_ip, get_vm_list
+from conductor.vms import (
+    check_cloud_init_complete,
+    get_available_distro_versions,
+    get_running_vms,
+    get_stopped_vms,
+    get_vm_ip,
+    get_vm_list,
+    get_vm_state,
+)
 
 console = Console()
 
@@ -405,29 +413,103 @@ def create_vms(
         sys.exit(1)
 
 
-def show_status(as_json: bool) -> None:
-    """Show status of all test VMs."""
+def show_status(as_json: bool, check_cloudinit: bool) -> None:
+    """
+    Show status of all test VMs.
+    
+    Args:
+        as_json: Output as JSON
+        check_cloudinit: Check cloud-init completion status (slower but more informative)
+    """
     vms = get_vm_list()
     
     if not vms:
         console.print("[yellow]No test VMs found[/]")
         return
     
+    config = load_config()
+    vms_config = config.get("vms", {})
+    vm_user = vms_config.get("username", "conductor")
+    ssh_key_default = "~/.ssh/conductor-test-key"
+    ssh_key_path = os.path.expanduser(
+        vms_config.get("ssh_key_path", ssh_key_default)
+    )
+    
     if as_json:
         import json
-        data = [{"name": vm} for vm in vms]
+        data = []
+        for vm in vms:
+            vm_info = {"name": vm}
+            state = get_vm_state(vm)
+            vm_info["state"] = state
+            
+            if state == "running":
+                ip = get_vm_ip(vm)
+                vm_info["ip"] = ip
+                
+                if check_cloudinit and ip:
+                    cloudinit_ready = check_cloud_init_complete(vm, ip, ssh_key_path, vm_user)
+                    vm_info["cloud_init_ready"] = cloudinit_ready
+            
+            data.append(vm_info)
+        
         console.print_json(json.dumps(data))
         return
     
     console.print()
     table = Table(title="Conductor Test VMs")
     table.add_column("VM Name", style="cyan")
+    table.add_column("State", style="yellow")
+    table.add_column("IP Address", style="green")
+    
+    if check_cloudinit:
+        table.add_column("Cloud-Init", justify="center", style="blue")
+    
+    cloudinit_ready_count = 0
+    cloudinit_not_ready_count = 0
     
     for vm in vms:
-        table.add_row(vm)
+        state = get_vm_state(vm)
+        state_display = state.capitalize() if state != "unknown" else "[dim]unknown[/]"
+        
+        if state == "running":
+            ip = get_vm_ip(vm)
+            ip_display = ip if ip else "[dim]pending...[/]"
+            
+            if check_cloudinit:
+                if ip:
+                    cloudinit_ready = check_cloud_init_complete(vm, ip, ssh_key_path, vm_user)
+                    if cloudinit_ready:
+                        cloudinit_display = "[green]✓ Ready[/]"
+                        cloudinit_ready_count += 1
+                    else:
+                        cloudinit_display = "[yellow]⏳ Running...[/]"
+                        cloudinit_not_ready_count += 1
+                else:
+                    cloudinit_display = "[dim]No IP[/]"
+                
+                table.add_row(vm, state_display, ip_display, cloudinit_display)
+            else:
+                table.add_row(vm, state_display, ip_display)
+        else:
+            if check_cloudinit:
+                table.add_row(vm, state_display, "[dim]—[/]", "[dim]—[/]")
+            else:
+                table.add_row(vm, state_display, "[dim]—[/]")
     
     console.print(table)
-    console.print(f"\n[dim]Total: {len(vms)} VMs[/]")
+    
+    if check_cloudinit:
+        running_vms = [v for v in vms if get_vm_state(v) == "running"]
+        console.print(f"\n[dim]Total: {len(vms)} VMs[/]")
+        console.print(f"[dim]Running: {len(running_vms)}[/]")
+        if running_vms:
+            console.print(f"[green]Cloud-init ready: {cloudinit_ready_count}[/]")
+            if cloudinit_not_ready_count > 0:
+                console.print(f"[yellow]Cloud-init still running: {cloudinit_not_ready_count}[/]")
+    else:
+        console.print(f"\n[dim]Total: {len(vms)} VMs[/]")
+        console.print(f"[dim]Use --check-cloudinit to see cloud-init status[/]")
 
 
 def create_all_vms(memory: int, cpus: int) -> None:
@@ -550,6 +632,19 @@ def run_snail_on_vms(
         vms_config.get("ssh_key_path", ssh_key_default)
     )
     
+    # Verify SSH key exists
+    if not os.path.exists(ssh_key_path):
+        console.print(f"[red]SSH key not found: {ssh_key_path}[/]")
+        console.print("[yellow]The SSH key should be generated during VM creation.[/]")
+        console.print("[yellow]If VMs were created manually, ensure the key exists.[/]")
+        sys.exit(1)
+    
+    # Check key permissions (should be 600)
+    key_stat = os.stat(ssh_key_path)
+    if key_stat.st_mode & 0o077 != 0:
+        console.print(f"[yellow]Warning: SSH key has insecure permissions[/]")
+        console.print(f"[dim]Run: chmod 600 {ssh_key_path}[/]")
+    
     # Get running VMs
     running_vms = get_running_vms()
     
@@ -576,6 +671,67 @@ def run_snail_on_vms(
     
     console.print(f"\n[dim]Running snail-core on {len(vm_ips)} VM(s)...[/]\n")
     
+    # First, verify SSH connectivity and wait for cloud-init to complete
+    console.print("[dim]Verifying SSH connectivity (waiting for cloud-init to complete)...[/]")
+    ssh_ready = {}
+    max_wait_time = 300  # 5 minutes max wait
+    check_interval = 10  # Check every 10 seconds
+    max_attempts = max_wait_time // check_interval
+    
+    for vm_name, ip in vm_ips.items():
+        console.print(f"[cyan]Checking {vm_name} ({ip})...[/]")
+        
+        # Try a simple SSH command to check if key is authorized
+        test_cmd = [
+            "ssh",
+            "-i", ssh_key_path,
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=5",
+            "-o", "BatchMode=yes",
+            "-o", "PasswordAuthentication=no",
+            "-o", "PubkeyAuthentication=yes",
+            "-q",  # Quiet mode
+            f"{vm_user}@{ip}",
+            "echo 'SSH ready'"
+        ]
+        
+        import time
+        ssh_connected = False
+        for attempt in range(max_attempts):
+            test_result = run_command(test_cmd, capture=True, check=False, timeout=10)
+            if test_result.returncode == 0:
+                ssh_ready[vm_name] = ip
+                ssh_connected = True
+                if attempt == 0:
+                    console.print(f"[green]✓[/] {vm_name}: SSH ready")
+                else:
+                    console.print(f"[green]✓[/] {vm_name}: SSH ready (after {attempt * check_interval}s)")
+                break
+            else:
+                if attempt == 0:
+                    console.print(f"[dim]  → Waiting for cloud-init to complete...[/]")
+                elif attempt % 3 == 0:  # Show progress every 30 seconds
+                    console.print(f"[dim]  → Still waiting... ({attempt * check_interval}s elapsed)[/]")
+            
+            if attempt < max_attempts - 1:
+                time.sleep(check_interval)
+        
+        if not ssh_connected:
+            console.print(f"[red]✗[/] {vm_name}: SSH not ready after {max_wait_time}s")
+            console.print(f"[yellow]  → Cloud-init may still be running on the VM[/]")
+            console.print(f"[dim]  → Check VM console: sudo virsh console {vm_name}[/]")
+            console.print(f"[dim]  → Or wait a few more minutes and try again[/]")
+            console.print(f"[dim]  → You can also manually verify: ssh -i {ssh_key_path} {vm_user}@{ip}[/]")
+    
+    if not ssh_ready:
+        console.print("\n[red]No VMs are ready for SSH connections[/]")
+        console.print("[yellow]Please wait for cloud-init to complete on the VMs[/]")
+        console.print("[dim]You can check VM status with: ./conductor.py status[/]")
+        return
+    
+    console.print(f"\n[dim]Proceeding with {len(ssh_ready)} VM(s) that are SSH-ready...[/]\n")
+    
     # Build SSH command
     ssh_cmd_base = [
         "ssh",
@@ -583,17 +739,58 @@ def run_snail_on_vms(
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "ConnectTimeout=10",
-        "-o", f"ServerAliveInterval={timeout // 3}",
+        "-o", "ServerAliveInterval=5",
+        "-o", "PasswordAuthentication=no",
+        "-o", "PubkeyAuthentication=yes",
+        "-o", "BatchMode=yes",  # Non-interactive mode
     ]
+    
+    # Add verbose flag if DEBUG is set
+    if os.getenv("DEBUG"):
+        ssh_cmd_base.append("-v")
+    else:
+        ssh_cmd_base.append("-q")
+    
+    # Handle localhost in upload URL - VMs can't reach localhost, need host IP
+    if upload_url:
+        # Check if URL contains localhost or 127.0.0.1
+        if "localhost" in upload_url or "127.0.0.1" in upload_url:
+            # Try to find the host IP on the libvirt network
+            host_ip_result = run_command(
+                ["ip", "addr", "show", "virbr0"],
+                capture=True,
+                check=False
+            )
+            
+            host_ip = None
+            if host_ip_result.returncode == 0:
+                import re
+                # Extract IP from virbr0 interface (e.g., "inet 192.168.124.1/24")
+                ip_match = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+)', host_ip_result.stdout)
+                if ip_match:
+                    host_ip = ip_match.group(1)
+            
+            if host_ip:
+                # Replace localhost/127.0.0.1 with host IP
+                fixed_url = upload_url.replace("localhost", host_ip).replace("127.0.0.1", host_ip)
+                console.print(f"[yellow]⚠[/] Replaced localhost with host IP: {host_ip}")
+                console.print(f"[dim]  Original URL: {upload_url}[/]")
+                console.print(f"[dim]  Using URL: {fixed_url}[/]\n")
+                upload_url = fixed_url
+            else:
+                console.print(f"[yellow]⚠[/] Warning: Upload URL contains 'localhost' or '127.0.0.1'")
+                console.print(f"[yellow]  VMs cannot reach localhost - they need the host's IP address[/]")
+                console.print(f"[yellow]  Please use the host IP instead (e.g., http://192.168.124.1:8080/api/v1/ingest)[/]")
+                console.print(f"[dim]  Continuing anyway, but upload may fail...[/]\n")
     
     # Build snail-core command
     snail_cmd = "/opt/snail-core/venv/bin/snail run"
     if upload_url:
-        snail_cmd = f"SNAIL_API_ENDPOINT={upload_url} {snail_cmd}"
+        snail_cmd = f"SNAIL_UPLOAD_URL={upload_url} {snail_cmd}"
     
-    # Run on each VM
+    # Run on each VM (only those that are SSH-ready)
     results = {}
-    for vm_name, ip in vm_ips.items():
+    for vm_name, ip in ssh_ready.items():
         console.print(f"[cyan]Running on {vm_name} ({ip})...[/]")
         
         ssh_cmd = ssh_cmd_base + [
@@ -611,12 +808,53 @@ def run_snail_on_vms(
             
             if result.returncode == 0:
                 console.print(f"[green]✓[/] {vm_name}: Success")
+                # Show output if available (snail-core may produce output)
+                if result.stdout and result.stdout.strip():
+                    # Show last few lines of output
+                    output_lines = result.stdout.strip().split('\n')
+                    if len(output_lines) > 0:
+                        # Look for key messages
+                        for line in output_lines[-5:]:  # Last 5 lines
+                            if any(keyword in line.lower() for keyword in ['upload', 'success', 'error', 'failed', 'collecting']):
+                                console.print(f"[dim]  → {line[:100]}[/]")
                 results[vm_name] = ("success", result.stdout)
             else:
                 console.print(f"[red]✗[/] {vm_name}: Failed (exit code {result.returncode})")
-                if result.stderr:
-                    console.print(f"[dim]Error: {result.stderr[:200]}[/]")
-                results[vm_name] = ("failed", result.stderr)
+                
+                # Provide helpful error messages
+                error_output = result.stderr or result.stdout or ""
+                if "Permission denied" in error_output or "publickey" in error_output:
+                    console.print(f"[yellow]  → SSH authentication failed[/]")
+                    console.print(f"[dim]  → Ensure the public key is in the VM's authorized_keys[/]")
+                    console.print(f"[dim]  → Check if cloud-init has finished on the VM[/]")
+                    console.print(f"[dim]  → Try: ssh -i {ssh_key_path} {vm_user}@{ip} 'echo test'[/]")
+                elif "Connection refused" in error_output or "No route to host" in error_output:
+                    console.print(f"[yellow]  → Cannot connect to VM[/]")
+                    console.print(f"[dim]  → VM may still be booting or network not ready[/]")
+                else:
+                    if error_output:
+                        # Show more detailed error output
+                        error_lines = error_output.split('\n')
+                        # Filter out SSH warnings and show actual errors
+                        relevant_lines = [
+                            line for line in error_lines
+                            if line.strip() and not line.strip().startswith('Warning:')
+                        ]
+                        if not relevant_lines:
+                            relevant_lines = error_lines[:5]  # Fallback to first 5 lines
+                        
+                        for line in relevant_lines[:5]:  # Show up to 5 relevant lines
+                            if line.strip():
+                                console.print(f"[dim]  → {line[:150]}[/]")
+                        
+                        # Also check stdout for errors
+                        if result.stdout:
+                            stdout_lines = result.stdout.split('\n')
+                            for line in stdout_lines:
+                                if any(keyword in line.lower() for keyword in ['error', 'failed', 'cannot', 'unable']):
+                                    console.print(f"[dim]  → {line[:150]}[/]")
+                
+                results[vm_name] = ("failed", error_output)
         except subprocess.TimeoutExpired:
             console.print(f"[yellow]⚠[/] {vm_name}: Timeout after {timeout}s")
             results[vm_name] = ("timeout", None)

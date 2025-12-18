@@ -93,9 +93,15 @@ def create(
     is_flag=True,
     help="Output as JSON"
 )
-def status(as_json: bool):
+@click.option(
+    "--check-cloudinit",
+    "check_cloudinit",
+    is_flag=True,
+    help="Check cloud-init completion status (slower but more informative)"
+)
+def status(as_json: bool, check_cloudinit: bool):
     """Show status of all test VMs."""
-    show_status(as_json)
+    show_status(as_json, check_cloudinit)
 
 
 @cli.command("create-all")

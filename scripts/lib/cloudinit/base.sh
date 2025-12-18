@@ -65,7 +65,15 @@ EOF
 # Create cloud-init ISO
 create_cloud_init_iso() {
     local vm_name="$1"
-    local cloudinit_dir="${CLOUDINIT_DIR}/${vm_name}"
+    # If a full path is passed, use it directly; otherwise construct it
+    local cloudinit_dir
+    if [[ "$vm_name" == /* ]]; then
+        # Full path provided
+        cloudinit_dir="$vm_name"
+    else
+        # Just VM name, construct full path
+        cloudinit_dir="${CLOUDINIT_DIR}/${vm_name}"
+    fi
     local iso_path="${cloudinit_dir}/cloud-init.iso"
     
     genisoimage -output "$iso_path" \
