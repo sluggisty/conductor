@@ -1177,14 +1177,113 @@ def start_vms(
     console.print(f"\n[green]✓ All {len(stopped_vms)} VM(s) have been started![/]")
 
 
+def _ensure_cloudinit_iso_or_detach(vm_name: str) -> None:
+    """
+    Ensure cloud-init ISO exists or detach it from VM definition.
+    
+    Cloud-init ISO is only needed for first boot. If it's missing,
+    we try to recreate it. If that fails, we detach it from the VM
+    definition since it's no longer needed.
+    
+    Args:
+        vm_name: Name of the VM to check
+    """
+    config = load_config()
+    host_config = config.get("host", {})
+    cloudinit_dir = host_config.get("cloudinit_dir", "/tmp/conductor-test-cloudinit")
+    cloudinit_path = Path(cloudinit_dir) / vm_name / "cloud-init.iso"
+    
+    # Check if ISO exists
+    if cloudinit_path.exists():
+        return  # ISO exists, nothing to do
+    
+    # ISO is missing - check if we can recreate it
+    cloudinit_dir_path = Path(cloudinit_dir) / vm_name
+    user_data_path = cloudinit_dir_path / "user-data"
+    meta_data_path = cloudinit_dir_path / "meta-data"
+    
+    if user_data_path.exists() and meta_data_path.exists():
+        # We can recreate the ISO
+        console.print(f"  [yellow]⚠[/] Cloud-init ISO missing, recreating...")
+        try:
+            # Use genisoimage to recreate the ISO
+            run_command(
+                [
+                    "genisoimage",
+                    "-output", str(cloudinit_path),
+                    "-volid", "cidata",
+                    "-joliet",
+                    "-rock",
+                    str(user_data_path),
+                    str(meta_data_path),
+                ],
+                sudo=True,
+                check=True,
+            )
+            console.print(f"  [green]✓[/] Cloud-init ISO recreated")
+            return
+        except subprocess.CalledProcessError:
+            console.print(f"  [red]✗[/] Failed to recreate cloud-init ISO")
+            # Fall through to detach
+    
+    # Can't recreate - detach the ISO from VM definition
+    # Cloud-init ISO is only needed for first boot anyway
+    console.print(f"  [yellow]⚠[/] Cloud-init ISO missing and cannot be recreated")
+    console.print(f"  [dim]  → Detaching cloud-init ISO from VM (only needed for first boot)[/]")
+    
+    # Get list of block devices to find the cloud-init ISO
+    result = run_command(
+        ["virsh", "domblklist", vm_name, "--details"],
+        sudo=True,
+        check=False,
+    )
+    
+    if result.returncode != 0:
+        console.print(f"  [yellow]⚠[/] Could not list VM block devices")
+        return
+    
+    # Look for cloud-init ISO in the block device list
+    # Format: "Target     Source" or "hdb        /path/to/cloud-init.iso"
+    import re
+    for line in result.stdout.split('\n'):
+        if 'cloud-init.iso' in line:
+            # Extract device name (first column)
+            parts = line.split()
+            if len(parts) >= 2:
+                device = parts[0]
+                # Detach the disk
+                detach_result = run_command(
+                    ["virsh", "detach-disk", vm_name, device, "--config"],
+                    sudo=True,
+                    check=False,
+                )
+                
+                if detach_result.returncode == 0:
+                    console.print(f"  [green]✓[/] Detached cloud-init ISO from VM")
+                    return
+                else:
+                    console.print(f"  [yellow]⚠[/] Could not detach device {device}")
+    
+    # If we get here, cloud-init ISO wasn't found in block list
+    # It might already be detached or the VM definition is inconsistent
+    console.print(f"  [dim]  → Cloud-init ISO not found in VM block devices (may already be detached)[/]")
+
+
 def _start_single_vm(vm_name: str) -> None:
     """
     Start a single VM.
+    
+    Handles missing cloud-init ISO files by either recreating them
+    or detaching them from the VM definition (since they're only
+    needed for first boot).
     
     Args:
         vm_name: Name of the VM to start
     """
     console.print(f"[cyan]Starting {vm_name}...[/]")
+    
+    # Check if cloud-init ISO is missing and handle it
+    _ensure_cloudinit_iso_or_detach(vm_name)
     
     result = run_command(
         ["virsh", "start", vm_name],
@@ -1197,7 +1296,15 @@ def _start_single_vm(vm_name: str) -> None:
     else:
         console.print(f"  [red]✗[/] {vm_name} failed to start")
         if result.stderr:
-            console.print(f"  [dim]Error: {result.stderr[:200]}[/]")
+            error_msg = result.stderr.strip()
+            console.print(f"  [dim]Error: {error_msg[:200]}[/]")
+            
+            # Provide helpful guidance for common errors
+            if "Cannot access storage file" in error_msg and "cloud-init.iso" in error_msg:
+                console.print(f"  [yellow]⚠[/] Cloud-init ISO file is missing")
+                console.print(f"  [dim]  → The cloud-init ISO was likely deleted[/]")
+                console.print(f"  [dim]  → Try running: ./conductor.py start {vm_name} again[/]")
+                console.print(f"  [dim]  → Or manually detach it: sudo virsh detach-disk {vm_name} hdb --config[/]")
 
 
 def _destroy_single_vm(vm_name: str, image_dir: str) -> None:
