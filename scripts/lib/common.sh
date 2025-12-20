@@ -106,5 +106,65 @@ parse_vm_spec() {
     fi
 }
 
+# Create directory with proper permissions, using sudo if needed
+ensure_directory() {
+    local dir_path="$1"
+    local owner="${2:-$USER}"
+    
+    # Check if directory is in a system path that requires root
+    local needs_sudo=false
+    if [[ "$dir_path" == /var/* ]] || \
+       [[ "$dir_path" == /usr/* ]] || \
+       [[ "$dir_path" == /etc/* ]] || \
+       [[ "$dir_path" == /opt/* ]]; then
+        needs_sudo=true
+    fi
+    
+    # Check if parent directory exists and is writable
+    local parent_dir=$(dirname "$dir_path")
+    if [[ ! -w "$parent_dir" ]] && [[ "$parent_dir" != "/" ]]; then
+        needs_sudo=true
+    fi
+    
+    if [[ "$needs_sudo" == true ]]; then
+        # Create directory with sudo and set ownership
+        if [[ ! -d "$dir_path" ]]; then
+            sudo mkdir -p "$dir_path"
+            sudo chown "$owner:$owner" "$dir_path"
+            sudo chmod 755 "$dir_path"
+        else
+            # Directory exists, ensure ownership is correct
+            local current_owner=$(stat -c '%U' "$dir_path" 2>/dev/null || echo "")
+            if [[ "$current_owner" != "$owner" ]]; then
+                sudo chown "$owner:$owner" "$dir_path"
+            fi
+        fi
+    else
+        # Create directory normally
+        mkdir -p "$dir_path"
+    fi
+}
+
+# Check if a path needs sudo for file operations
+needs_sudo_for_path() {
+    local path="$1"
+    
+    # Check if path is in a system directory
+    if [[ "$path" == /var/* ]] || \
+       [[ "$path" == /usr/* ]] || \
+       [[ "$path" == /etc/* ]] || \
+       [[ "$path" == /opt/* ]]; then
+        return 0  # true - needs sudo
+    fi
+    
+    # Check if parent directory is writable
+    local parent_dir=$(dirname "$path")
+    if [[ ! -w "$parent_dir" ]] && [[ "$parent_dir" != "/" ]]; then
+        return 0  # true - needs sudo
+    fi
+    
+    return 1  # false - doesn't need sudo
+}
+
 
 

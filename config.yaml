@@ -138,5 +138,5 @@ host:
   image_dir: "/var/lib/libvirt/images"
   
   # Path to store cloud-init ISOs
-  cloudinit_dir: "/tmp/conductor-test-cloudinit"
-
+  #cloudinit_dir: "/tmp/conductor-test-cloudinit"
+  cloudinit_dir: "/var/lib/conductor/cloudinit"  # Instead of /tmp

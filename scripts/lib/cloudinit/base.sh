@@ -13,7 +13,8 @@ create_cloud_init() {
     local version="$4"
     local output_dir="${CLOUDINIT_DIR}/${vm_name}"
     
-    mkdir -p "$output_dir"
+    # Create directory with proper permissions (using sudo if needed)
+    ensure_directory "$output_dir"
     
     # Read SSH public key
     local ssh_pubkey=""
@@ -22,6 +23,7 @@ create_cloud_init() {
     fi
     
     # Create meta-data
+    # Note: Directory ownership is set by ensure_directory, so we can write normally
     cat > "${output_dir}/meta-data" << EOF
 instance-id: ${vm_name}
 local-hostname: ${vm_name}
@@ -76,13 +78,26 @@ create_cloud_init_iso() {
     fi
     local iso_path="${cloudinit_dir}/cloud-init.iso"
     
-    genisoimage -output "$iso_path" \
-        -volid cidata \
-        -joliet \
-        -rock \
-        "${cloudinit_dir}/user-data" \
-        "${cloudinit_dir}/meta-data" \
-        > /dev/null 2>&1
+    # Create ISO (use sudo if directory requires it, but ownership should be set correctly)
+    if needs_sudo_for_path "$iso_path"; then
+        sudo genisoimage -output "$iso_path" \
+            -volid cidata \
+            -joliet \
+            -rock \
+            "${cloudinit_dir}/user-data" \
+            "${cloudinit_dir}/meta-data" \
+            > /dev/null 2>&1
+        # Ensure user owns the ISO file
+        sudo chown "$USER:$USER" "$iso_path"
+    else
+        genisoimage -output "$iso_path" \
+            -volid cidata \
+            -joliet \
+            -rock \
+            "${cloudinit_dir}/user-data" \
+            "${cloudinit_dir}/meta-data" \
+            > /dev/null 2>&1
+    fi
     
     echo "$iso_path"
 }
