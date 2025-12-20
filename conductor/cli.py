@@ -8,14 +8,18 @@ import click
 
 from conductor import __version__
 from conductor.commands import (
+    check_cloudinit_status,
     create_all_vms,
     create_vms,
+    debug_vm,
     destroy_vms,
     list_versions,
     run_snail_on_vms,
+    show_cloudinit_logs,
     shutdown_vms,
     show_status,
     start_vms,
+    wait_for_ssh,
 )
 
 
@@ -183,5 +187,51 @@ def shutdown(force: bool, vm: str | None):
 def destroy(force: bool, vm: str | None):
     """Destroy (shutdown and remove) VMs."""
     destroy_vms(force, vm)
+
+
+@cli.command("cloudinit-status")
+@click.option(
+    "--vm",
+    help="Check specific VM by name (default: all running VMs)"
+)
+def cloudinit_status(vm: str | None):
+    """Check cloud-init status for VMs."""
+    check_cloudinit_status(vm)
+
+
+@cli.command("cloudinit-logs")
+@click.argument("vm_name", required=True)
+@click.option(
+    "--lines", "-n",
+    default=50,
+    help="Number of log lines to show (default: 50)"
+)
+def cloudinit_logs(vm_name: str, lines: int):
+    """Show cloud-init logs for a specific VM."""
+    show_cloudinit_logs(vm_name, lines)
+
+
+@cli.command("debug")
+@click.argument("vm_name", required=True)
+def debug(vm_name: str):
+    """Debug a VM using multiple methods without requiring login."""
+    debug_vm(vm_name)
+
+
+@cli.command("wait-ssh")
+@click.argument("vm_name", required=True)
+@click.option(
+    "--timeout", "-t",
+    default=300,
+    help="Maximum time to wait in seconds (default: 300)"
+)
+@click.option(
+    "--interval", "-i",
+    default=5,
+    help="How often to check in seconds (default: 5)"
+)
+def wait_ssh(vm_name: str, timeout: int, interval: int):
+    """Wait for SSH to become available on a VM."""
+    wait_for_ssh(vm_name, timeout, interval)
 
 

@@ -15,6 +15,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from conductor.config import SCRIPTS_DIR, load_config
+import yaml
 from conductor.images import check_image_exists, get_base_image_path, scan_available_images
 from conductor.utils import run_command
 from conductor.vms import (
@@ -947,11 +948,35 @@ def destroy_vms(
     if cloudinit_path.exists():
         console.print(f"\n[dim]Cleaning up cloud-init directory...[/]")
         import shutil
+        
+        # Check if directory is in a system path that requires root
+        needs_sudo = (
+            str(cloudinit_path).startswith("/var/") or
+            str(cloudinit_path).startswith("/usr/") or
+            str(cloudinit_path).startswith("/etc/") or
+            str(cloudinit_path).startswith("/opt/")
+        )
+        
         try:
-            shutil.rmtree(cloudinit_path)
-            console.print(f"[green]✓[/] Removed {cloudinit_dir}")
+            if needs_sudo:
+                # Use sudo to remove system directory
+                result = run_command(
+                    ["rm", "-rf", str(cloudinit_path)],
+                    sudo=True,
+                    check=False
+                )
+                if result.returncode == 0:
+                    console.print(f"[green]✓[/] Removed {cloudinit_dir}")
+                else:
+                    console.print(f"[yellow]⚠[/] Failed to remove cloud-init directory: {result.stderr}")
+            else:
+                # Regular removal for user-writable paths
+                shutil.rmtree(cloudinit_path)
+                console.print(f"[green]✓[/] Removed {cloudinit_dir}")
         except Exception as e:
             console.print(f"[yellow]⚠[/] Failed to remove cloud-init directory: {e}")
+            if needs_sudo:
+                console.print(f"[dim]  → Try manually: sudo rm -rf {cloudinit_dir}[/]")
     
     # Remove VM list file if it exists
     vm_list_file = Path(__file__).parent.parent / "vm-list.txt"
@@ -1267,6 +1292,841 @@ def _ensure_cloudinit_iso_or_detach(vm_name: str) -> None:
     # If we get here, cloud-init ISO wasn't found in block list
     # It might already be detached or the VM definition is inconsistent
     console.print(f"  [dim]  → Cloud-init ISO not found in VM block devices (may already be detached)[/]")
+
+
+def check_cloudinit_status(
+    vm_name: str | None
+) -> None:
+    """
+    Check cloud-init status and logs for a VM.
+    
+    Shows detailed information about cloud-init progress, including:
+    - Current status (running, done, error)
+    - Recent log entries
+    - What cloud-init is currently doing
+    
+    Args:
+        vm_name: Specific VM name to check, or None to check all running VMs
+    """
+    console.print(Panel.fit(
+        "[bold cyan]Cloud-Init Status Check[/]",
+        border_style="cyan"
+    ))
+    
+    config = load_config()
+    vms_config = config.get("vms", {})
+    host_config = config.get("host", {})
+    vm_prefix = vms_config.get("name_prefix", "conductor-test")
+    ssh_key_path = host_config.get("ssh_key_path", f"{os.path.expanduser('~')}/.ssh/conductor-test-key")
+    vm_user = vms_config.get("user", "conductor")
+    
+    # Handle specific VM
+    if vm_name:
+        _check_single_vm_cloudinit(vm_name, ssh_key_path, vm_user)
+        return
+    
+    # Check all running VMs
+    running_vms = get_running_vms()
+    
+    if not running_vms:
+        console.print(f"[yellow]No running VMs found with prefix: {vm_prefix}[/]")
+        return
+    
+    console.print(f"\n[dim]Found {len(running_vms)} running VM(s)...[/]\n")
+    
+    for vm in running_vms:
+        _check_single_vm_cloudinit(vm, ssh_key_path, vm_user)
+        console.print()  # Add spacing between VMs
+
+
+def _check_single_vm_cloudinit(vm_name: str, ssh_key_path: str, vm_user: str) -> None:
+    """
+    Check cloud-init status for a single VM.
+    
+    Args:
+        vm_name: Name of the VM
+        ssh_key_path: Path to SSH private key
+        vm_user: Username for SSH
+    """
+    console.print(f"[bold]{vm_name}[/]")
+    
+    # Get VM state and uptime info
+    vm_state = get_vm_state(vm_name)
+    if vm_state != "running":
+        console.print(f"  [yellow]⚠[/] VM is not running (state: {vm_state})")
+        return
+    
+    # Get VM IP
+    ip = get_vm_ip(vm_name)
+    if not ip:
+        console.print(f"  [yellow]⚠[/] No IP address yet (VM is booting)")
+        console.print(f"  [dim]  → This is normal during early boot phase[/]")
+        console.print(f"  [dim]  → Cloud-init typically takes 1-3 minutes to complete[/]")
+        console.print(f"  [dim]  → Check VM console: sudo virsh console {vm_name}[/]")
+        console.print(f"  [dim]  → Or wait a bit and try: ./conductor.py cloudinit-status --vm {vm_name}[/]")
+        return
+    
+    console.print(f"  [dim]IP: {ip}[/]")
+    
+    # Try to ping the VM first (quick connectivity check)
+    ping_result = run_command(
+        ["ping", "-c", "1", "-W", "2", ip],
+        capture=True,
+        check=False,
+        timeout=5
+    )
+    
+    if ping_result.returncode != 0:
+        console.print(f"  [yellow]⚠[/] VM not responding to ping")
+        console.print(f"  [dim]  → VM may still be booting or network not ready[/]")
+        console.print(f"  [dim]  → Check VM console: sudo virsh console {vm_name}[/]")
+        return
+    
+    # Try to get cloud-init status via SSH
+    status_cmd = [
+        "ssh",
+        "-i", ssh_key_path,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=5",
+        "-o", "BatchMode=yes",
+        "-q",
+        f"{vm_user}@{ip}",
+        "cloud-init status 2>/dev/null || echo 'cloud-init-command-not-found'"
+    ]
+    
+    result = run_command(status_cmd, capture=True, check=False, timeout=10)
+    
+    if result.returncode != 0:
+        # SSH failed - provide detailed troubleshooting
+        console.print(f"  [yellow]⚠[/] Cannot connect via SSH")
+        console.print(f"  [dim]  → Cloud-init is likely still running (SSH keys not installed yet)[/]")
+        console.print()
+        
+        # Check if console is available
+        console_check = run_command(
+            ["virsh", "qemu-monitor-command", vm_name, "--hmp", "info status"],
+            sudo=True,
+            check=False,
+            timeout=3
+        )
+        
+        console.print(f"  [bold]Troubleshooting steps:[/]")
+        console.print()
+        console.print(f"  [dim]  1. Check VM console:[/] [cyan]sudo virsh console {vm_name} --force[/]")
+        console.print(f"  [dim]     [yellow]Important:[/] The 'conductor' user is created by cloud-init.[/]")
+        console.print(f"  [dim]     [yellow]If cloud-init hasn't finished, you may need to login as 'root' first.[/]")
+        console.print(f"  [dim]     [yellow]Try root password:[/] [cyan]conductortest123[/] (same as conductor user)[/]")
+        console.print(f"  [dim]     [yellow]Or wait for cloud-init to complete, then login as:[/] [cyan]conductor[/]")
+        console.print(f"  [dim]     [yellow]Password:[/] [cyan]conductortest123[/]")
+        console.print(f"  [dim]     [yellow]Once logged in, check:[/] [cyan]cloud-init status[/]")
+        console.print(f"  [dim]     [yellow]Or check if user exists:[/] [cyan]id conductor[/]")
+        console.print()
+        console.print(f"  [dim]  2. Wait and retry:[/] [cyan]./conductor.py cloudinit-status --vm {vm_name}[/]")
+        console.print(f"  [dim]     (Cloud-init typically takes 1-3 minutes)[/]")
+        console.print()
+        console.print(f"  [dim]  3. Check VM boot time:[/] [cyan]sudo virsh dominfo {vm_name} | grep 'CPU time'[/]")
+        console.print(f"  [dim]     (If CPU time is very low, VM just started)[/]")
+        console.print()
+        console.print(f"  [dim]  4. Try alternative access:[/]")
+        console.print(f"  [dim]     [yellow]  • Check if qemu-guest-agent is available:[/]")
+        agent_cmd = f"sudo virsh qemu-agent-command {vm_name} '{{\"execute\":\"guest-info\"}}'"
+        console.print(f"  [dim]     [yellow]    {agent_cmd}[/]")
+        return
+    
+    if "cloud-init-command-not-found" in result.stdout:
+        # Try alternative: check boot-finished file
+        check_cmd = [
+            "ssh",
+            "-i", ssh_key_path,
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=5",
+            "-o", "BatchMode=yes",
+            "-q",
+            f"{vm_user}@{ip}",
+            "if [ -f /var/lib/cloud/instance/boot-finished ]; then echo 'done'; else echo 'running'; fi"
+        ]
+        
+        check_result = run_command(check_cmd, capture=True, check=False, timeout=10)
+        if check_result.returncode == 0:
+            if "done" in check_result.stdout:
+                console.print(f"  [green]✓[/] Cloud-init: [green]Complete[/]")
+            else:
+                console.print(f"  [yellow]⏳[/] Cloud-init: [yellow]Still running[/]")
+                console.print(f"  [dim]  → Boot-finished file not found yet[/]")
+        return
+    
+    # Parse cloud-init status output
+    status_output = result.stdout.strip()
+    
+    if "status: done" in status_output or "status: active" in status_output:
+        console.print(f"  [green]✓[/] Cloud-init: [green]Complete[/]")
+    elif "status: running" in status_output:
+        console.print(f"  [yellow]⏳[/] Cloud-init: [yellow]Running[/]")
+        
+        # Try to get what cloud-init is doing
+        stage_cmd = [
+            "ssh",
+            "-i", ssh_key_path,
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=5",
+            "-o", "BatchMode=yes",
+            "-q",
+            f"{vm_user}@{ip}",
+            "cat /var/lib/cloud/data/status.json 2>/dev/null | grep -o '\"stage\":\"[^\"]*\"' | head -1 || echo ''"
+        ]
+        
+        stage_result = run_command(stage_cmd, capture=True, check=False, timeout=10)
+        if stage_result.returncode == 0 and stage_result.stdout.strip():
+            stage = stage_result.stdout.strip().replace('"stage":"', '').replace('"', '')
+            if stage:
+                console.print(f"  [dim]  → Current stage: {stage}[/]")
+    elif "status: error" in status_output:
+        console.print(f"  [red]✗[/] Cloud-init: [red]Error[/]")
+        console.print(f"  [dim]  → Check logs: ./conductor.py cloudinit-logs {vm_name}[/]")
+    else:
+        console.print(f"  [yellow]?[/] Cloud-init: [yellow]Unknown status[/]")
+        console.print(f"  [dim]  → Output: {status_output[:100]}[/]")
+    
+    # Show recent log entries
+    console.print(f"  [dim]Recent cloud-init activity:[/]")
+    log_cmd = [
+        "ssh",
+        "-i", ssh_key_path,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=5",
+        "-o", "BatchMode=yes",
+        "-q",
+        f"{vm_user}@{ip}",
+        "tail -20 /var/log/cloud-init.log 2>/dev/null | tail -5 || echo 'Log file not accessible'"
+    ]
+    
+    log_result = run_command(log_cmd, capture=True, check=False, timeout=10)
+    if log_result.returncode == 0 and log_result.stdout.strip():
+        log_lines = log_result.stdout.strip().split('\n')
+        for line in log_lines[-3:]:  # Show last 3 lines
+            if line.strip() and "Log file not accessible" not in line:
+                # Truncate long lines
+                display_line = line[:120] + "..." if len(line) > 120 else line
+                console.print(f"  [dim]    {display_line}[/]")
+
+
+def wait_for_ssh(
+    vm_name: str,
+    timeout: int = 300,
+    interval: int = 5
+) -> None:
+    """
+    Wait for SSH to become available on a VM.
+    
+    Polls SSH connectivity and shows progress while waiting for cloud-init
+    to complete and SSH keys to be added.
+    
+    Args:
+        vm_name: Name of the VM to wait for
+        timeout: Maximum time to wait in seconds (default: 300 = 5 minutes)
+        interval: How often to check in seconds (default: 5)
+    """
+    console.print(Panel.fit(
+        f"[bold cyan]Waiting for SSH: {vm_name}[/]",
+        border_style="cyan"
+    ))
+    
+    config = load_config()
+    host_config = config.get("host", {})
+    vms_config = config.get("vms", {})
+    ssh_key_path = host_config.get("ssh_key_path", f"{os.path.expanduser('~')}/.ssh/conductor-test-key")
+    vm_user = vms_config.get("user", "conductor")
+    
+    # Get VM IP
+    ip = get_vm_ip(vm_name)
+    if not ip:
+        console.print(f"[red]✗[/] No IP address (VM may still be booting)")
+        console.print(f"[dim]Check VM status: ./conductor.py status[/]")
+        return
+    
+    console.print(f"[dim]VM IP: {ip}[/]")
+    console.print(f"[dim]Waiting up to {timeout} seconds for SSH to become available...[/]\n")
+    
+    import time
+    import socket
+    start_time = time.time()
+    last_status = None
+    
+    while time.time() - start_time < timeout:
+        elapsed = int(time.time() - start_time)
+        
+        # Check if SSH port is open
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        port_open = sock.connect_ex((ip, 22)) == 0
+        sock.close()
+        
+        if not port_open:
+            status = "SSH port not open"
+            if status != last_status:
+                console.print(f"[yellow]⏳[/] [{elapsed}s] {status}...")
+                last_status = status
+            time.sleep(interval)
+            continue
+        
+        # Port is open, try SSH connection
+        ssh_test_cmd = [
+            "ssh",
+            "-i", ssh_key_path,
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=2",
+            "-o", "BatchMode=yes",
+            "-q",
+            f"{vm_user}@{ip}",
+            "echo 'SSH_OK'"
+        ]
+        
+        result = run_command(ssh_test_cmd, capture=True, check=False, timeout=3)
+        
+        if result.returncode == 0 and "SSH_OK" in result.stdout:
+            console.print(f"\n[green]✓[/] SSH is now available! (took {elapsed}s)")
+            console.print(f"[dim]You can now connect with:[/]")
+            console.print(f"[cyan]  ssh -i {ssh_key_path} {vm_user}@{ip}[/]")
+            return
+        else:
+            status = "SSH port open, waiting for keys"
+            if status != last_status:
+                console.print(f"[yellow]⏳[/] [{elapsed}s] {status}...")
+                last_status = status
+        
+        time.sleep(interval)
+    
+    # Timeout
+    console.print(f"\n[red]✗[/] Timeout after {timeout} seconds")
+    console.print(f"[yellow]SSH is still not available[/]")
+    console.print(f"[dim]Possible issues:[/]")
+    console.print(f"[dim]  → Cloud-init may have failed[/]")
+    console.print(f"[dim]  → Check VM console: sudo virsh console {vm_name} --force[/]")
+    console.print(f"[dim]  → Check cloud-init logs: ./conductor.py debug {vm_name}[/]")
+
+
+def debug_vm(
+    vm_name: str
+) -> None:
+    """
+    Debug a VM using multiple methods without requiring login.
+    
+    Tries various approaches to inspect VM state, cloud-init status,
+    and configuration without needing console or SSH access.
+    
+    Args:
+        vm_name: Name of the VM to debug
+    """
+    console.print(Panel.fit(
+        f"[bold yellow]VM Debug: {vm_name}[/]",
+        border_style="yellow"
+    ))
+    
+    config = load_config()
+    host_config = config.get("host", {})
+    vms_config = config.get("vms", {})
+    cloudinit_dir = host_config.get("cloudinit_dir", "/tmp/conductor-test-cloudinit")
+    ssh_key_path = host_config.get("ssh_key_path", f"{os.path.expanduser('~')}/.ssh/conductor-test-key")
+    vm_user = vms_config.get("user", "conductor")
+    
+    console.print(f"\n[bold]1. VM Basic Information[/]\n")
+    
+    # Check VM state
+    vm_state = get_vm_state(vm_name)
+    console.print(f"  [dim]State:[/] {vm_state}")
+    
+    # Get VM info
+    info_result = run_command(
+        ["virsh", "dominfo", vm_name],
+        sudo=True,
+        check=False
+    )
+    if info_result.returncode == 0:
+        for line in info_result.stdout.strip().split('\n'):
+            if 'CPU time' in line or 'Max memory' in line or 'Used memory' in line:
+                console.print(f"  [dim]{line.strip()}[/]")
+    
+    # Note: CPU time is cumulative CPU usage, not wall-clock uptime
+    # Check if VM was recently started by looking at creation/start time
+    console.print(f"  [dim]Note: 'CPU time' is cumulative CPU usage, not actual uptime[/]")
+    
+    # Try to get actual boot time from VM
+    # Check when VM was last started using virsh
+    start_time_result = run_command(
+        ["virsh", "dominfo", vm_name],
+        sudo=True,
+        check=False
+    )
+    
+    # Try to read /proc/uptime or similar via guest-file-read
+    import json
+    import base64
+    try:
+        uptime_read_cmd = '{"execute":"guest-file-read","arguments":{"path":"/proc/uptime","count":20}}'
+        uptime_result = run_command(
+            ["virsh", "qemu-agent-command", vm_name, uptime_read_cmd],
+            sudo=True,
+            check=False,
+            timeout=5
+        )
+        if uptime_result.returncode == 0:
+            result_data = json.loads(uptime_result.stdout)
+            if "return" in result_data and "content" in result_data["return"]:
+                uptime_content = base64.b64decode(result_data["return"]["content"]).decode('utf-8')
+                if uptime_content.strip():
+                    uptime_seconds = float(uptime_content.strip().split()[0])
+                    uptime_minutes = int(uptime_seconds / 60)
+                    uptime_hours = int(uptime_minutes / 60)
+                    if uptime_hours > 0:
+                        console.print(f"  [cyan]Actual VM uptime: ~{uptime_hours}h {uptime_minutes % 60}m[/]")
+                    elif uptime_minutes > 0:
+                        console.print(f"  [cyan]Actual VM uptime: ~{uptime_minutes}m {int(uptime_seconds % 60)}s[/]")
+                    else:
+                        console.print(f"  [cyan]Actual VM uptime: ~{int(uptime_seconds)}s[/]")
+                    
+                    # If uptime is very short but VM was created long ago, it was restarted
+                    if uptime_seconds < 120:  # Less than 2 minutes
+                        console.print(f"  [yellow]⚠[/] VM appears to have been restarted recently")
+                        console.print(f"  [dim]  → If you created this VM 10+ minutes ago, it was likely stopped/restarted[/]")
+                        console.print(f"  [dim]  → This explains why cloud-init is still running[/]")
+            elif "return" in result_data and "errno" in result_data["return"]:
+                console.print(f"  [dim]  Cannot read /proc/uptime (guest-file-read not available or file not accessible)[/]")
+        else:
+            console.print(f"  [dim]  Cannot read /proc/uptime (guest agent may not support guest-file-read)[/]")
+    except Exception as e:
+        console.print(f"  [dim]  Error reading uptime: {e}[/]")
+    
+    # Get IP
+    ip = get_vm_ip(vm_name)
+    if ip:
+        console.print(f"  [dim]IP Address:[/] {ip}")
+        
+        # Test connectivity
+        ping_result = run_command(
+            ["ping", "-c", "1", "-W", "2", ip],
+            capture=True,
+            check=False,
+            timeout=5
+        )
+        if ping_result.returncode == 0:
+            console.print(f"  [green]✓[/] VM is reachable via ping")
+        else:
+            console.print(f"  [red]✗[/] VM not responding to ping")
+    else:
+        console.print(f"  [yellow]⚠[/] No IP address assigned yet")
+    
+    console.print(f"\n[bold]2. Cloud-Init Configuration[/]\n")
+    
+    # Check cloud-init user-data
+    cloudinit_user_data = Path(cloudinit_dir) / vm_name / "user-data"
+    if cloudinit_user_data.exists():
+        console.print(f"  [green]✓[/] Cloud-init user-data exists: {cloudinit_user_data}")
+        
+        # Show relevant parts and validate
+        try:
+            with open(cloudinit_user_data) as f:
+                content = f.read()
+            
+            # Validate YAML syntax
+            try:
+                yaml.safe_load(content)
+                console.print(f"  [green]✓[/] Cloud-init user-data is valid YAML")
+            except yaml.YAMLError as e:
+                console.print(f"  [red]✗[/] Cloud-init user-data has YAML syntax errors!")
+                console.print(f"  [red]  Error: {e}[/]")
+                console.print(f"  [yellow]  → This will prevent cloud-init from working![/]")
+            
+            # Check for SSH key configuration (critical for SSH access)
+            if 'ssh_authorized_keys:' in content:
+                console.print(f"  [green]✓[/] SSH authorized keys configuration found")
+                # Count how many keys
+                key_count = content.count('- ssh-')
+                if key_count > 0:
+                    console.print(f"  [dim]  Found {key_count} SSH key(s) in config[/]")
+                else:
+                    console.print(f"  [yellow]⚠[/] SSH keys section exists but no keys found![/]")
+            else:
+                console.print(f"  [red]✗[/] SSH authorized keys not found in user-data!")
+                console.print(f"  [yellow]  → This explains why SSH authentication fails![/]")
+            
+            # Check for root password config
+            if 'root:' in content and 'chpasswd' in content:
+                console.print(f"  [green]✓[/] Root password configuration found in chpasswd")
+            else:
+                console.print(f"  [yellow]⚠[/] Root password not found in chpasswd")
+            
+            if 'disable_root: false' in content:
+                console.print(f"  [green]✓[/] Root login is enabled (disable_root: false)")
+            elif 'disable_root: true' in content:
+                console.print(f"  [red]✗[/] Root login is disabled (disable_root: true)")
+            else:
+                console.print(f"  [yellow]⚠[/] disable_root setting not found (defaults to true)")
+            
+            # Check for root in users section
+            if 'name: root' in content or '- name: root' in content:
+                console.print(f"  [green]✓[/] Root user defined in users section")
+            else:
+                console.print(f"  [yellow]⚠[/] Root user not in users section")
+        except Exception as e:
+            console.print(f"  [red]✗[/] Error reading user-data: {e}")
+    else:
+        console.print(f"  [red]✗[/] Cloud-init user-data not found: {cloudinit_user_data}")
+    
+    # Check cloud-init ISO
+    cloudinit_iso = Path(cloudinit_dir) / vm_name / "cloud-init.iso"
+    if cloudinit_iso.exists():
+        console.print(f"  [green]✓[/] Cloud-init ISO exists: {cloudinit_iso}")
+        iso_size = cloudinit_iso.stat().st_size
+        console.print(f"  [dim]  ISO size: {iso_size} bytes[/]")
+    else:
+        console.print(f"  [yellow]⚠[/] Cloud-init ISO not found")
+    
+    console.print(f"\n[bold]3. VM Disk and Storage[/]\n")
+    
+    # Check VM disk
+    disk_result = run_command(
+        ["virsh", "domblklist", vm_name, "--details"],
+        sudo=True,
+        check=False
+    )
+    if disk_result.returncode == 0:
+        for line in disk_result.stdout.strip().split('\n'):
+            if 'cloud-init.iso' in line or '.qcow2' in line:
+                console.print(f"  [dim]{line.strip()}[/]")
+    
+    console.print(f"\n[bold]4. QEMU Guest Agent[/]\n")
+    
+    # Try qemu-guest-agent
+    agent_result = run_command(
+        ["virsh", "qemu-agent-command", vm_name, '{"execute":"guest-info"}'],
+        sudo=True,
+        check=False,
+        timeout=5
+    )
+    if agent_result.returncode == 0:
+        console.print(f"  [green]✓[/] QEMU Guest Agent is available")
+        console.print(f"  [dim]  Can execute commands in VM without SSH[/]")
+        
+        # QEMU Guest Agent doesn't support guest-exec, use alternative methods
+        console.print(f"\n  [bold]Checking VM status (using alternative methods)...[/]")
+        
+        import json
+        import base64
+        import socket
+        
+        # Check SSH port from host side
+        console.print(f"\n  [bold]Checking SSH connectivity...[/]")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        ssh_open = sock.connect_ex((ip, 22))
+        sock.close()
+        
+        if ssh_open == 0:
+            console.print(f"  [green]✓[/] SSH port 22 is open and accepting connections")
+            
+            # Try SSH connection test
+            ssh_test_cmd = [
+                "ssh",
+                "-i", ssh_key_path,
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "ConnectTimeout=3",
+                "-o", "BatchMode=yes",
+                "-q",
+                f"{vm_user}@{ip}",
+                "echo 'SSH_OK'"
+            ]
+            ssh_test = run_command(ssh_test_cmd, capture=True, check=False, timeout=5)
+            if ssh_test.returncode == 0 and "SSH_OK" in ssh_test.stdout:
+                console.print(f"  [green]✓[/] SSH connection successful! Cloud-init is complete.")
+            elif ssh_test.returncode == 255:
+                console.print(f"  [yellow]⚠[/] SSH port open but authentication failed")
+                console.print(f"  [dim]  → This usually means cloud-init hasn't added SSH keys yet[/]")
+                console.print(f"  [dim]  → Wait a bit longer for cloud-init to complete[/]")
+            else:
+                console.print(f"  [yellow]⚠[/] SSH port open but connection failed")
+        else:
+            console.print(f"  [yellow]⚠[/] SSH port 22 is not open or not accepting connections")
+            console.print(f"  [dim]  → SSH service may not be started yet[/]")
+            console.print(f"  [dim]  → Or firewall is blocking SSH[/]")
+        
+        # Try to read cloud-init log file using guest-file-read (if available)
+        console.print(f"\n  [bold]Trying to read cloud-init log via Guest Agent...[/]")
+        
+        log_read_cmd = '{"execute":"guest-file-read","arguments":{"path":"/var/log/cloud-init.log","count":50}}'
+        log_result = run_command(
+            ["virsh", "qemu-agent-command", vm_name, log_read_cmd],
+            sudo=True,
+            check=False,
+            timeout=5
+        )
+        
+        if log_result.returncode == 0:
+            try:
+                result_data = json.loads(log_result.stdout)
+                if "return" in result_data and "content" in result_data["return"]:
+                    log_content = base64.b64decode(result_data["return"]["content"]).decode('utf-8')
+                    # Show last few lines
+                    log_lines = log_content.strip().split('\n')
+                    console.print(f"  [dim]Last few cloud-init log lines:[/]")
+                    for line in log_lines[-5:]:
+                        if line.strip():
+                            # Color code errors/warnings
+                            if any(keyword in line.lower() for keyword in ['error', 'failed', 'failure']):
+                                console.print(f"  [red]  {line[:100]}[/]")
+                            elif any(keyword in line.lower() for keyword in ['warning', 'warn']):
+                                console.print(f"  [yellow]  {line[:100]}[/]")
+                            else:
+                                console.print(f"  [dim]  {line[:100]}[/]")
+            except Exception as e:
+                console.print(f"  [dim]  Could not parse log: {e}[/]")
+        else:
+            console.print(f"  [dim]  Guest file read not available or log not accessible yet[/]")
+        
+        # Check boot-finished file
+        boot_read_cmd = '{"execute":"guest-file-read","arguments":{"path":"/var/lib/cloud/instance/boot-finished","count":10}}'
+        boot_result = run_command(
+            ["virsh", "qemu-agent-command", vm_name, boot_read_cmd],
+            sudo=True,
+            check=False,
+            timeout=5
+        )
+        
+        if boot_result.returncode == 0:
+            try:
+                result_data = json.loads(boot_result.stdout)
+                if "return" in result_data and "content" in result_data["return"]:
+                    console.print(f"  [green]✓[/] Boot-finished file exists (cloud-init complete)")
+                elif "return" in result_data and "errno" in result_data["return"]:
+                    console.print(f"  [yellow]⚠[/] Boot-finished file not found (cloud-init still running)")
+            except Exception:
+                pass
+        
+        # Check if boot-finished file exists
+        boot_check_cmd = '{"execute":"guest-exec","arguments":{"path":"/usr/bin/test","arg":["-f","/var/lib/cloud/instance/boot-finished"],"capture-output":true}}'
+        boot_result = run_command(
+            ["virsh", "qemu-agent-command", vm_name, boot_check_cmd],
+            sudo=True,
+            check=False,
+            timeout=10
+        )
+        
+        # Check SSH service status
+        console.print(f"\n  [bold]Checking SSH service via Guest Agent...[/]")
+        ssh_check_cmd = '{"execute":"guest-exec","arguments":{"path":"/usr/bin/systemctl","arg":["is-active","sshd"],"capture-output":true}}'
+        ssh_result = run_command(
+            ["virsh", "qemu-agent-command", vm_name, ssh_check_cmd],
+            sudo=True,
+            check=False,
+            timeout=10
+        )
+        
+        if ssh_result.returncode == 0:
+            try:
+                result_data = json.loads(ssh_result.stdout)
+                if "return" in result_data and "pid" in result_data["return"]:
+                    pid = result_data["return"]["pid"]
+                    import time
+                    time.sleep(1)
+                    get_result_cmd = f'{{"execute":"guest-exec-status","arguments":{{"pid":{pid}}}}}'
+                    get_result = run_command(
+                        ["virsh", "qemu-agent-command", vm_name, get_result_cmd],
+                        sudo=True,
+                        check=False,
+                        timeout=5
+                    )
+                    if get_result.returncode == 0:
+                        result_json = json.loads(get_result.stdout)
+                        if "return" in result_json:
+                            if "out-data" in result_json["return"]:
+                                import base64
+                                output = base64.b64decode(result_json["return"]["out-data"]).decode('utf-8')
+                                if "active" in output.lower():
+                                    console.print(f"  [green]✓[/] SSH service is active")
+                                else:
+                                    console.print(f"  [yellow]⚠[/] SSH service status: {output.strip()}")
+                            elif "exited" in result_json["return"] and result_json["return"].get("exited") == True:
+                                exitcode = result_json["return"].get("exitcode", -1)
+                                if exitcode == 0:
+                                    console.print(f"  [green]✓[/] SSH service check completed")
+                                else:
+                                    console.print(f"  [yellow]⚠[/] SSH service check failed (exit code: {exitcode})")
+            except Exception as e:
+                console.print(f"  [dim]  Could not parse SSH status: {e}[/]")
+        
+        # Check if conductor user exists
+        user_check_cmd = '{"execute":"guest-exec","arguments":{"path":"/usr/bin/id","arg":["conductor"],"capture-output":true}}'
+        user_result = run_command(
+            ["virsh", "qemu-agent-command", vm_name, user_check_cmd],
+            sudo=True,
+            check=False,
+            timeout=10
+        )
+        
+        if user_result.returncode == 0:
+            try:
+                result_data = json.loads(user_result.stdout)
+                if "return" in result_data and "pid" in result_data["return"]:
+                    pid = result_data["return"]["pid"]
+                    import time
+                    time.sleep(1)
+                    get_result_cmd = f'{{"execute":"guest-exec-status","arguments":{{"pid":{pid}}}}}'
+                    get_result = run_command(
+                        ["virsh", "qemu-agent-command", vm_name, get_result_cmd],
+                        sudo=True,
+                        check=False,
+                        timeout=5
+                    )
+                    if get_result.returncode == 0:
+                        result_json = json.loads(get_result.stdout)
+                        if "return" in result_json and "out-data" in result_json["return"]:
+                            import base64
+                            output = base64.b64decode(result_json["return"]["out-data"]).decode('utf-8')
+                            console.print(f"\n  [bold]Checking conductor user...[/]")
+                            console.print(f"  [green]✓[/] Conductor user exists: {output.strip()}")
+                        elif "return" in result_json and result_json["return"].get("exited") == True:
+                            exitcode = result_json["return"].get("exitcode", -1)
+                            if exitcode != 0:
+                                console.print(f"\n  [bold]Checking conductor user...[/]")
+                                console.print(f"  [yellow]⚠[/] Conductor user may not exist yet (exit code: {exitcode})")
+            except Exception as e:
+                pass
+    else:
+        console.print(f"  [yellow]⚠[/] QEMU Guest Agent not available or not responding")
+        console.print(f"  [dim]  Error: {agent_result.stderr[:100] if agent_result.stderr else 'No response'}[/]")
+    
+    console.print(f"\n[bold]5. Boot Messages[/]\n")
+    
+    # Try to get recent boot messages
+    console_result = run_command(
+        ["virsh", "qemu-monitor-command", vm_name, "--hmp", "info status"],
+        sudo=True,
+        check=False,
+        timeout=3
+    )
+    if console_result.returncode == 0:
+        console.print(f"  [green]✓[/] QEMU monitor accessible")
+    
+    console.print(f"\n[bold]6. Recommendations[/]\n")
+    
+    if not ip:
+        console.print(f"  [yellow]→[/] VM doesn't have an IP yet. Wait for network initialization.")
+    elif ping_result.returncode != 0 if ip else True:
+        console.print(f"  [yellow]→[/] VM is not responding to ping. May still be booting.")
+    else:
+        console.print(f"  [yellow]→[/] VM is reachable. Try SSH once cloud-init completes:")
+        ssh_key_path = host_config.get("ssh_key_path", f"{os.path.expanduser('~')}/.ssh/conductor-test-key")
+        vm_user = vms_config.get("user", "conductor")
+        console.print(f"  [cyan]    ssh -i {ssh_key_path} {vm_user}@{ip}[/]")
+    
+    if not cloudinit_user_data.exists():
+        console.print(f"  [red]→[/] Cloud-init user-data missing! VM may not have been created properly.")
+    
+    console.print(f"\n  [yellow]→[/] To view cloud-init logs (once SSH works):")
+    console.print(f"  [cyan]    ./conductor.py cloudinit-logs {vm_name}[/]")
+    
+    console.print(f"\n  [yellow]→[/] To check cloud-init status (once SSH works):")
+    console.print(f"  [cyan]    ./conductor.py cloudinit-status --vm {vm_name}[/]")
+    
+    # If SSH has been failing for a while, provide urgent troubleshooting
+    console.print(f"\n  [bold red]⚠ URGENT: If SSH still doesn't work after 10+ minutes:[/]")
+    console.print(f"  [dim]  1. Cloud-init may be stuck or failed[/]")
+    console.print(f"  [dim]  2. Try to see boot messages (even without login):[/]")
+    console.print(f"  [cyan]     sudo virsh console {vm_name} --force[/]")
+    console.print(f"  [dim]     (Press Enter a few times, look for cloud-init errors)[/]")
+    console.print(f"  [dim]  3. Check if cloud-init ISO is readable:[/]")
+    console.print(f"  [cyan]     file {cloudinit_iso}[/]")
+    console.print(f"  [dim]  4. Verify cloud-init user-data is valid YAML:[/]")
+    console.print(f"  [cyan]     python3 -c \"import yaml; yaml.safe_load(open('{cloudinit_user_data}'))\"[/]")
+    console.print(f"  [dim]  5. Consider recreating the VM:[/]")
+    console.print(f"  [cyan]     ./conductor.py destroy --vm {vm_name}[/]")
+    console.print(f"  [cyan]     ./conductor.py create --specs centos:9 --count 1[/]")
+
+
+def show_cloudinit_logs(
+    vm_name: str,
+    lines: int
+) -> None:
+    """
+    Show cloud-init logs for a VM.
+    
+    Args:
+        vm_name: Name of the VM to check
+        lines: Number of log lines to show (default: 50)
+    """
+    console.print(Panel.fit(
+        f"[bold cyan]Cloud-Init Logs: {vm_name}[/]",
+        border_style="cyan"
+    ))
+    
+    config = load_config()
+    host_config = config.get("host", {})
+    vms_config = config.get("vms", {})
+    ssh_key_path = host_config.get("ssh_key_path", f"{os.path.expanduser('~')}/.ssh/conductor-test-key")
+    vm_user = vms_config.get("user", "conductor")
+    
+    # Get VM IP
+    ip = get_vm_ip(vm_name)
+    if not ip:
+        console.print(f"[red]✗[/] No IP address (VM may not be running)")
+        console.print(f"[dim]Check VM status: ./conductor.py status[/]")
+        return
+    
+    console.print(f"[dim]VM IP: {ip}[/]\n")
+    
+    # Get cloud-init logs via SSH
+    log_cmd = [
+        "ssh",
+        "-i", ssh_key_path,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=5",
+        "-o", "BatchMode=yes",
+        "-q",
+        f"{vm_user}@{ip}",
+        f"tail -{lines} /var/log/cloud-init.log 2>/dev/null || echo 'ERROR: Cannot access cloud-init log file'"
+    ]
+    
+    result = run_command(log_cmd, capture=True, check=False, timeout=15)
+    
+    if result.returncode != 0:
+        console.print(f"[red]✗[/] Cannot connect via SSH")
+        console.print(f"[dim]  → Cloud-init may still be running (SSH not ready yet)[/]")
+        console.print(f"[dim]  → Check VM console: sudo virsh console {vm_name}[/]")
+        return
+    
+    if "ERROR:" in result.stdout:
+        console.print(f"[red]{result.stdout}[/]")
+        console.print(f"[dim]  → Try checking VM console: sudo virsh console {vm_name}[/]")
+        return
+    
+    if not result.stdout.strip():
+        console.print(f"[yellow]⚠[/] No log output (cloud-init may not have started yet)")
+        return
+    
+    # Display logs with syntax highlighting for errors/warnings
+    console.print("[dim]Cloud-init log output:[/]\n")
+    for line in result.stdout.strip().split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Color code based on log level
+        if any(keyword in line.lower() for keyword in ['error', 'failed', 'failure', 'exception']):
+            console.print(f"[red]{line}[/]")
+        elif any(keyword in line.lower() for keyword in ['warning', 'warn']):
+            console.print(f"[yellow]{line}[/]")
+        elif any(keyword in line.lower() for keyword in ['info', 'started', 'completed', 'finished']):
+            console.print(f"[green]{line}[/]")
+        else:
+            console.print(f"[dim]{line}[/]")
+    
+    console.print(f"\n[dim]Showing last {lines} lines. Use --lines to show more.[/]")
 
 
 def _start_single_vm(vm_name: str) -> None:

@@ -104,8 +104,8 @@ main() {
         exit 1
     fi
     
-    # Create cloud-init directory
-    mkdir -p "$CLOUDINIT_DIR"
+    # Create cloud-init directory (with sudo if needed for system paths)
+    ensure_directory "$CLOUDINIT_DIR"
     
     # Create VMs for each spec
     local vm_counter=1
