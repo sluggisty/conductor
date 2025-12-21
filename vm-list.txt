@@ -1,1 +1,1 @@
-conductor-test-centos-9-1
+conductor-test-ubuntu-24.04-1
