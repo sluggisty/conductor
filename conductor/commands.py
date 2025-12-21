@@ -655,19 +655,44 @@ def run_snail_on_vms(
     
     console.print(f"\n[dim]Found {len(running_vms)} running VM(s)[/]\n")
     
-    # Get IP addresses for all VMs
+    # Get IP addresses for all VMs (with retry logic)
     vm_ips = {}
     console.print("[dim]Getting IP addresses...[/]")
+    
+    import time
+    max_ip_wait_time = 120  # 2 minutes max wait for IP
+    ip_check_interval = 5  # Check every 5 seconds
+    max_ip_attempts = max_ip_wait_time // ip_check_interval
+    
     for vm_name in running_vms:
-        ip = get_vm_ip(vm_name)
-        if ip:
-            vm_ips[vm_name] = ip
-            console.print(f"[green]✓[/] {vm_name}: {ip}")
-        else:
-            console.print(f"[yellow]⚠[/] {vm_name}: No IP address found")
+        ip = None
+        for attempt in range(max_ip_attempts):
+            ip = get_vm_ip(vm_name)
+            if ip:
+                vm_ips[vm_name] = ip
+                if attempt == 0:
+                    console.print(f"[green]✓[/] {vm_name}: {ip}")
+                else:
+                    console.print(f"[green]✓[/] {vm_name}: {ip} (after {attempt * ip_check_interval}s)")
+                break
+            else:
+                if attempt == 0:
+                    console.print(f"[dim]  → {vm_name}: Waiting for IP address...[/]")
+                elif attempt % 6 == 0:  # Show progress every 30 seconds
+                    console.print(f"[dim]  → {vm_name}: Still waiting for IP... ({attempt * ip_check_interval}s elapsed)[/]")
+            
+            if attempt < max_ip_attempts - 1:
+                time.sleep(ip_check_interval)
+        
+        if not ip:
+            console.print(f"[yellow]⚠[/] {vm_name}: No IP address found after {max_ip_wait_time}s")
+            console.print(f"[dim]  → VM may still be booting or network may not be configured[/]")
+            console.print(f"[dim]  → Check VM status: ./conductor.py status[/]")
+            console.print(f"[dim]  → Check VM console: sudo virsh console {vm_name}[/]")
     
     if not vm_ips:
         console.print("[red]No VMs with IP addresses found[/]")
+        console.print("[yellow]VMs may still be booting. Wait a few minutes and try again.[/]")
         return
     
     console.print(f"\n[dim]Running snail-core on {len(vm_ips)} VM(s)...[/]\n")
