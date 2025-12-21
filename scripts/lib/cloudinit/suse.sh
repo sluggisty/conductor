@@ -74,55 +74,55 @@ runcmd:
   # Create configuration file
   - |
     cat > /etc/snail-core/config.yaml << 'EOF2'
-api:
-  endpoint: ${SNAIL_API_ENDPOINT}
-  api_key: ${SNAIL_API_KEY}
-  timeout: 30
-  retries: 3
-auth:
-  api_key: ${SNAIL_API_KEY}
-collection:
-  enabled_collectors: []
-  disabled_collectors: []
-  timeout: 300
-output:
-  dir: /var/lib/snail-core
-  keep_local: true
-  compress: true
-logging:
-  level: INFO
+    api:
+      endpoint: ${SNAIL_API_ENDPOINT}
+      api_key: ${SNAIL_API_KEY}
+      timeout: 30
+      retries: 3
+    auth:
+      api_key: ${SNAIL_API_KEY}
+    collection:
+      enabled_collectors: []
+      disabled_collectors: []
+      timeout: 300
+    output:
+      dir: /var/lib/snail-core
+      keep_local: true
+      compress: true
+    logging:
+      level: INFO
     EOF2
   
   # Create systemd service for snail
   - |
     cat > /etc/systemd/system/snail-core.service << 'SNAILSERVICE'
-[Unit]
-Description=Snail Core System Collection
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/opt/snail-core/venv/bin/snail run
-Environment=SNAIL_API_KEY=${SNAIL_API_KEY}
-
-[Install]
-WantedBy=multi-user.target
-SNAILSERVICE
+    [Unit]
+    Description=Snail Core System Collection
+    After=network-online.target
+    Wants=network-online.target
+    
+    [Service]
+    Type=oneshot
+    ExecStart=/opt/snail-core/venv/bin/snail run
+    Environment=SNAIL_API_KEY=${SNAIL_API_KEY}
+    
+    [Install]
+    WantedBy=multi-user.target
+    SNAILSERVICE
   
   # Create timer to run periodically (every 5 minutes for testing)
   - |
     cat > /etc/systemd/system/snail-core.timer << 'SNAILTIMER'
-[Unit]
-Description=Run Snail Core periodically
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
-
-[Install]
-WantedBy=timers.target
-SNAILTIMER
+    [Unit]
+    Description=Run Snail Core periodically
+    
+    [Timer]
+    OnBootSec=2min
+    OnUnitActiveSec=5min
+    
+    [Install]
+    WantedBy=timers.target
+    SNAILTIMER
   
   # Create output directory
   - mkdir -p /var/lib/snail-core
