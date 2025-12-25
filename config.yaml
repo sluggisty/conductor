@@ -55,6 +55,7 @@ vms:
         "22.04": "Ubuntu 22.04 LTS (Jammy Jellyfish)"
         "20.04": "Ubuntu 20.04 LTS (Focal Fossa)"
         "18.04": "Ubuntu 18.04 LTS (Bionic Beaver)"
+      default_version: "24.04"  # Use 24.04 as default (better cloud-init support)
       default_version: "24.04"
     
     centos:

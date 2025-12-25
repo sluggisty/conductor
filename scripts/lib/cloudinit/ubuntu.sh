@@ -15,24 +15,48 @@ create_ubuntu_cloud_init() {
 hostname: ${vm_name}
 fqdn: ${vm_name}.local
 
+# Enable root login for console access (useful during cloud-init)
+disable_root: false
+
 # User configuration
 users:
+  # Create root user with password for console access
+  # IMPORTANT: For Ubuntu 20.04/22.04, we need to set root password explicitly
+  - name: root
+    lock_passwd: false
+    plain_text_passwd: ${VM_PASSWORD}
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+  
+  # Create conductor user
   - name: ${VM_USER}
     sudo: ALL=(ALL) NOPASSWD:ALL
     groups: sudo, adm, systemd-journal
     shell: /bin/bash
     lock_passwd: false
+    plain_text_passwd: ${VM_PASSWORD}
     ssh_authorized_keys:
       - ${ssh_pubkey}
 
-# Set password (for console access)
+# Set password (for console access) - backup method
 chpasswd:
   list: |
+    root:${VM_PASSWORD}
     ${VM_USER}:${VM_PASSWORD}
   expire: false
 
 # Enable SSH password auth (backup)
 ssh_pwauth: true
+
+# Ensure SSH service is enabled
+ssh:
+  emit_keys_to_console: false
+  allow_public_ssh_keys: true
+  disable_root: false
+
+# Network configuration - REMOVED (using runcmd instead for better Ubuntu 20.04/22.04 compatibility)
+# Ubuntu 20.04/22.04 have issues with cloud-init's network: section
+# We'll configure networking manually in runcmd instead
 
 # Install required packages
 packages:
@@ -49,6 +73,44 @@ packages:
 
 # Run commands after boot
 runcmd:
+  # Network configuration - manual setup for Ubuntu 20.04/22.04 compatibility
+  # This runs FIRST to ensure network is up before other services
+  # Write network status to a file for debugging
+  - echo "Starting network configuration..." > /tmp/network-setup.log 2>&1
+  - |
+    # Find the first non-loopback interface and bring it up
+    for iface in \$(ls /sys/class/net/ | grep -v lo); do
+      if [ -n "\$iface" ] && [ -d "/sys/class/net/\$iface" ]; then
+        echo "Found interface: \$iface" >> /tmp/network-setup.log
+        # Bring interface up
+        ip link set up dev \$iface 2>&1 | tee -a /tmp/network-setup.log || true
+        # Try dhclient (Ubuntu/Debian) - with longer timeout
+        timeout 30 dhclient -v \$iface 2>&1 | tee -a /tmp/network-setup.log || true
+        # Also try with -1 flag for one-shot mode
+        timeout 30 dhclient -1 -v \$iface 2>&1 | tee -a /tmp/network-setup.log || true
+        # Check if we got an IP
+        if ip addr show \$iface | grep -q "inet "; then
+          echo "SUCCESS: Interface \$iface has IP address" >> /tmp/network-setup.log
+          ip addr show \$iface >> /tmp/network-setup.log
+          break
+        else
+          echo "FAILED: Interface \$iface did not get IP address" >> /tmp/network-setup.log
+        fi
+      fi
+    done
+  # Ensure network services are running
+  - systemctl restart systemd-networkd 2>&1 | tee -a /tmp/network-setup.log || systemctl restart NetworkManager 2>&1 | tee -a /tmp/network-setup.log || true
+  - sleep 5
+  # Verify network is up and show IP
+  - ip addr show >> /tmp/network-setup.log 2>&1 || true
+  - echo "Network setup complete. Status:" >> /tmp/network-setup.log
+  - cat /tmp/network-setup.log || true
+  
+  # Ensure SSH service is enabled and started
+  - systemctl enable ssh || systemctl enable sshd || true
+  - systemctl start ssh || systemctl start sshd || true
+  - systemctl restart ssh || systemctl restart sshd || true
+  
   # Update system
   - apt-get update -y || true
   - apt-get upgrade -y || true

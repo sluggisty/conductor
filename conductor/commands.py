@@ -809,15 +809,50 @@ def run_snail_on_vms(
                 console.print(f"[yellow]  Please use the host IP instead (e.g., http://192.168.124.1:8080/api/v1/ingest)[/]")
                 console.print(f"[dim]  Continuing anyway, but upload may fail...[/]\n")
     
-    # Build snail-core command
-    snail_cmd = "/opt/snail-core/venv/bin/snail run"
-    if upload_url:
-        snail_cmd = f"SNAIL_UPLOAD_URL={upload_url} {snail_cmd}"
+    # Build snail-core command - try symlink first, then direct path
+    # The symlink is created at /usr/local/bin/snail by cloud-init
+    # Use a simple command that tries both locations
+    snail_binary = "snail"  # Try symlink first (in PATH)
+    snail_cmd = f"command -v {snail_binary} >/dev/null 2>&1 && {snail_binary} run || /opt/snail-core/venv/bin/snail run"
     
+    # Set environment variables for authentication
+    env_vars = []
+    if upload_url:
+        env_vars.append(f"SNAIL_UPLOAD_URL='{upload_url}'")
+    
+    # Add username and password for API key retrieval
+    env_vars.append("SNAIL_USERNAME='admin'")
+    env_vars.append("SNAIL_PASSWORD='changeme'")
+    
+    if env_vars:
+        env_exports = " && ".join(f"export {var}" for var in env_vars)
+        snail_cmd = f"{env_exports} && {snail_cmd}"
+
     # Run on each VM (only those that are SSH-ready)
     results = {}
     for vm_name, ip in ssh_ready.items():
         console.print(f"[cyan]Running on {vm_name} ({ip})...[/]")
+        
+        # First, verify snail-core is installed
+        check_cmd = [
+            "ssh",
+            "-i", ssh_key_path,
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=5",
+            "-o", "BatchMode=yes",
+            "-q",
+            f"{vm_user}@{ip}",
+            "test -f /opt/snail-core/venv/bin/snail || command -v snail >/dev/null 2>&1 || echo 'NOT_INSTALLED'"
+        ]
+        check_result = run_command(check_cmd, capture=True, check=False, timeout=5)
+        if check_result.returncode != 0 or "NOT_INSTALLED" in check_result.stdout:
+            console.print(f"[yellow]⚠[/] {vm_name}: snail-core not installed yet")
+            console.print(f"[dim]  → Cloud-init may still be running[/]")
+            console.print(f"[dim]  → Wait a few more minutes and try again[/]")
+            console.print(f"[dim]  → Check cloud-init status: ./conductor.py cloudinit-status --vm {vm_name}[/]")
+            results[vm_name] = {"success": False, "error": "snail-core not installed"}
+            continue
         
         ssh_cmd = ssh_cmd_base + [
             f"{vm_user}@{ip}",
@@ -1883,12 +1918,13 @@ def debug_vm(
         # Try to read cloud-init log file using guest-file-read (if available)
         console.print(f"\n  [bold]Trying to read cloud-init log via Guest Agent...[/]")
         
-        log_read_cmd = '{"execute":"guest-file-read","arguments":{"path":"/var/log/cloud-init.log","count":50}}'
+        # Try to read more of the log (last 100 lines, ~8KB)
+        log_read_cmd = '{"execute":"guest-file-read","arguments":{"path":"/var/log/cloud-init.log","count":8192}}'
         log_result = run_command(
             ["virsh", "qemu-agent-command", vm_name, log_read_cmd],
             sudo=True,
             check=False,
-            timeout=5
+            timeout=10
         )
         
         if log_result.returncode == 0:
@@ -1896,22 +1932,59 @@ def debug_vm(
                 result_data = json.loads(log_result.stdout)
                 if "return" in result_data and "content" in result_data["return"]:
                     log_content = base64.b64decode(result_data["return"]["content"]).decode('utf-8')
-                    # Show last few lines
+                    # Show last 30 lines for better context
                     log_lines = log_content.strip().split('\n')
-                    console.print(f"  [dim]Last few cloud-init log lines:[/]")
-                    for line in log_lines[-5:]:
+                    console.print(f"  [green]✓[/] Cloud-init log accessible (showing last 30 lines):[/]")
+                    console.print(f"  [dim]{'='*80}[/]")
+                    for line in log_lines[-30:]:
                         if line.strip():
                             # Color code errors/warnings
-                            if any(keyword in line.lower() for keyword in ['error', 'failed', 'failure']):
-                                console.print(f"  [red]  {line[:100]}[/]")
+                            if any(keyword in line.lower() for keyword in ['error', 'failed', 'failure', 'exception', 'traceback']):
+                                console.print(f"  [red]{line[:120]}[/]")
                             elif any(keyword in line.lower() for keyword in ['warning', 'warn']):
-                                console.print(f"  [yellow]  {line[:100]}[/]")
+                                console.print(f"  [yellow]{line[:120]}[/]")
+                            elif any(keyword in line.lower() for keyword in ['network', 'dhcp', 'interface', 'eth', 'ens', 'enp']):
+                                console.print(f"  [cyan]{line[:120]}[/]")
                             else:
-                                console.print(f"  [dim]  {line[:100]}[/]")
+                                console.print(f"  [dim]{line[:120]}[/]")
+                    console.print(f"  [dim]{'='*80}[/]")
+                    
+                    # Check for specific network-related errors
+                    log_lower = log_content.lower()
+                    if 'network' in log_lower and ('error' in log_lower or 'failed' in log_lower):
+                        console.print(f"\n  [yellow]⚠[/] Network-related errors detected in cloud-init log")
+                    if 'dhcp' in log_lower and ('timeout' in log_lower or 'failed' in log_lower):
+                        console.print(f"  [yellow]⚠[/] DHCP issues detected")
             except Exception as e:
                 console.print(f"  [dim]  Could not parse log: {e}[/]")
         else:
             console.print(f"  [dim]  Guest file read not available or log not accessible yet[/]")
+            
+            # Try alternative: read cloud-init-output.log
+            console.print(f"\n  [bold]Trying alternative log file (cloud-init-output.log)...[/]")
+            output_log_cmd = '{"execute":"guest-file-read","arguments":{"path":"/var/log/cloud-init-output.log","count":4096}}'
+            output_log_result = run_command(
+                ["virsh", "qemu-agent-command", vm_name, output_log_cmd],
+                sudo=True,
+                check=False,
+                timeout=10
+            )
+            if output_log_result.returncode == 0:
+                try:
+                    result_data = json.loads(output_log_result.stdout)
+                    if "return" in result_data and "content" in result_data["return"]:
+                        log_content = base64.b64decode(result_data["return"]["content"]).decode('utf-8')
+                        console.print(f"  [green]✓[/] Found cloud-init-output.log (last 20 lines):[/]")
+                        for line in log_content.strip().split('\n')[-20:]:
+                            if line.strip():
+                                if any(keyword in line.lower() for keyword in ['error', 'failed', 'failure']):
+                                    console.print(f"  [red]{line[:120]}[/]")
+                                elif any(keyword in line.lower() for keyword in ['network', 'dhcp', 'interface']):
+                                    console.print(f"  [cyan]{line[:120]}[/]")
+                                else:
+                                    console.print(f"  [dim]{line[:120]}[/]")
+                except Exception:
+                    pass
         
         # Check boot-finished file
         boot_read_cmd = '{"execute":"guest-file-read","arguments":{"path":"/var/lib/cloud/instance/boot-finished","count":10}}'
@@ -2061,16 +2134,189 @@ def debug_vm(
     # If SSH has been failing for a while, provide urgent troubleshooting
     console.print(f"\n  [bold red]⚠ URGENT: If SSH still doesn't work after 10+ minutes:[/]")
     console.print(f"  [dim]  1. Cloud-init may be stuck or failed[/]")
-    console.print(f"  [dim]  2. Try to see boot messages (even without login):[/]")
+    console.print(f"  [dim]  2. Check VM console for boot messages:[/]")
     console.print(f"  [cyan]     sudo virsh console {vm_name} --force[/]")
-    console.print(f"  [dim]     (Press Enter a few times, look for cloud-init errors)[/]")
-    console.print(f"  [dim]  3. Check if cloud-init ISO is readable:[/]")
+    console.print(f"  [dim]     (Press Enter a few times, look for cloud-init/network errors)[/]")
+    console.print(f"  [dim]     (Type 'root' and password 'conductortest123' if prompted)[/]")
+    console.print(f"  [dim]  3. Check libvirt network status:[/]")
+    console.print(f"  [cyan]     sudo virsh net-info default[/]")
+    console.print(f"  [cyan]     sudo virsh net-dhcp-leases default[/]")
+    console.print(f"  [dim]  4. Verify cloud-init user-data network config:[/]")
+    console.print(f"  [cyan]     grep -A 15 '^network:' {cloudinit_user_data}[/]")
+    console.print(f"  [dim]  5. Check if cloud-init ISO is readable:[/]")
     console.print(f"  [cyan]     file {cloudinit_iso}[/]")
-    console.print(f"  [dim]  4. Verify cloud-init user-data is valid YAML:[/]")
+    console.print(f"  [dim]  6. Verify cloud-init user-data is valid YAML:[/]")
     console.print(f"  [cyan]     python3 -c \"import yaml; yaml.safe_load(open('{cloudinit_user_data}'))\"[/]")
-    console.print(f"  [dim]  5. Consider recreating the VM:[/]")
+    console.print(f"  [dim]  7. For Ubuntu 20.04/22.04 network issues, try:[/]")
     console.print(f"  [cyan]     ./conductor.py destroy --vm {vm_name}[/]")
-    console.print(f"  [cyan]     ./conductor.py create --specs centos:9 --count 1[/]")
+    console.print(f"  [cyan]     ./conductor.py create --specs ubuntu:24.04 --count 1[/]")
+    console.print(f"  [dim]     (Ubuntu 24.04 has better cloud-init network support)[/]")
+
+
+def debug_network(vm_name: str) -> None:
+    """
+    Debug network configuration for a VM.
+    
+    Args:
+        vm_name: Name of the VM to debug
+    """
+    from conductor.config import load_config
+    from conductor.vms import get_vm_ip, get_vm_state
+    from conductor.utils import run_command
+    from pathlib import Path
+    
+    console.print(Panel.fit(
+        f"[bold cyan]Network Debug: {vm_name}[/]",
+        border_style="cyan"
+    ))
+    
+    # Check VM state
+    state = get_vm_state(vm_name)
+    if state != "running":
+        console.print(f"[red]✗[/] VM is not running (state: {state})")
+        console.print(f"[dim]Start the VM first: ./conductor.py start --vm {vm_name}[/]")
+        return
+    
+    console.print(f"[green]✓[/] VM is running\n")
+    
+    # Check libvirt network
+    console.print("[bold]1. Libvirt Network Status[/]\n")
+    net_info = run_command(
+        ["virsh", "net-info", "default"],
+        sudo=True,
+        check=False,
+        timeout=5
+    )
+    if net_info.returncode == 0:
+        console.print(f"[dim]{net_info.stdout}[/]")
+    else:
+        console.print(f"[red]✗[/] Cannot get network info: {net_info.stderr}")
+    
+    # Check DHCP leases
+    console.print("\n[bold]2. DHCP Leases[/]\n")
+    leases = run_command(
+        ["virsh", "net-dhcp-leases", "default"],
+        sudo=True,
+        check=False,
+        timeout=5
+    )
+    if leases.returncode == 0:
+        if vm_name in leases.stdout:
+            console.print(f"[green]✓[/] Found DHCP lease for {vm_name}:")
+            for line in leases.stdout.split('\n'):
+                if vm_name in line or '192.168.124' in line:
+                    console.print(f"  [cyan]{line}[/]")
+        else:
+            console.print(f"[yellow]⚠[/] No DHCP lease found for {vm_name}")
+            console.print("[dim]Available leases:[/]")
+            for line in leases.stdout.split('\n')[:10]:
+                if line.strip():
+                    console.print(f"  [dim]{line}[/]")
+    else:
+        console.print(f"[yellow]⚠[/] Cannot get DHCP leases: {leases.stderr}")
+    
+    # Check VM network interfaces
+    console.print("\n[bold]3. VM Network Interfaces[/]\n")
+    domiflist = run_command(
+        ["virsh", "domiflist", vm_name],
+        sudo=True,
+        check=False,
+        timeout=5
+    )
+    if domiflist.returncode == 0:
+        console.print("[green]✓[/] Network interfaces:")
+        for line in domiflist.stdout.split('\n'):
+            if line.strip() and not line.startswith('Interface'):
+                console.print(f"  [cyan]{line}[/]")
+    else:
+        console.print(f"[red]✗[/] Cannot get interface list: {domiflist.stderr}")
+    
+    # Check IP address
+    console.print("\n[bold]4. IP Address Assignment[/]\n")
+    ip = get_vm_ip(vm_name)
+    if ip:
+        console.print(f"[green]✓[/] IP Address: {ip}")
+        
+        # Test connectivity
+        ping_result = run_command(
+            ["ping", "-c", "1", "-W", "2", ip],
+            capture=True,
+            check=False,
+            timeout=5
+        )
+        if ping_result.returncode == 0:
+            console.print(f"[green]✓[/] VM is reachable via ping")
+        else:
+            console.print(f"[yellow]⚠[/] VM not responding to ping")
+    else:
+        console.print(f"[red]✗[/] No IP address assigned")
+        console.print(f"[dim]This usually means:[/]")
+        console.print(f"  [dim]  → DHCP hasn't assigned an IP yet (wait a few minutes)[/]")
+        console.print(f"  [dim]  → Network configuration in cloud-init failed[/]")
+        console.print(f"  [dim]  → Network interface isn't up[/]")
+    
+    # Check cloud-init network config
+    console.print("\n[bold]5. Cloud-Init Network Configuration[/]\n")
+    config = load_config()
+    # Get cloudinit_dir from config - it's under "host" section in config.yaml
+    host_config = config.get("host", {})
+    cloudinit_dir_str = host_config.get("cloudinit_dir", "/tmp/conductor-test-cloudinit")
+    cloudinit_dir = Path(cloudinit_dir_str)
+    user_data = cloudinit_dir / vm_name / "user-data"
+    
+    if user_data.exists():
+        with open(user_data) as f:
+            content = f.read()
+            if "network:" in content:
+                console.print(f"[green]✓[/] Network configuration found in user-data")
+                # Extract network section
+                import re
+                network_match = re.search(r'^network:.*?(?=^[a-z]|\Z)', content, re.MULTILINE | re.DOTALL)
+                if network_match:
+                    network_config = network_match.group(0)
+                    console.print("[dim]Network config:[/]")
+                    for line in network_config.split('\n')[:20]:
+                        if line.strip():
+                            console.print(f"  [dim]{line}[/]")
+            else:
+                console.print(f"[yellow]⚠[/] No network configuration found in user-data")
+    else:
+        console.print(f"[red]✗[/] Cloud-init user-data not found: {user_data}")
+        console.print(f"[dim]Expected path: {user_data}[/]")
+        console.print(f"[dim]Config says cloudinit_dir: {cloudinit_dir_str}[/]")
+        # Try to find it in common locations
+        alt_paths = [
+            Path("/var/lib/conductor/cloudinit") / vm_name / "user-data",
+            Path("/tmp/conductor-test-cloudinit") / vm_name / "user-data",
+        ]
+        for alt_path in alt_paths:
+            if alt_path.exists():
+                console.print(f"[yellow]⚠[/] Found user-data at alternative location: {alt_path}")
+                console.print("[dim]This suggests the config cloudinit_dir is incorrect[/]")
+                # Read from the found location
+                with open(alt_path) as f:
+                    content = f.read()
+                    if "network:" in content:
+                        console.print("[green]✓[/] Network configuration found in user-data")
+                        import re
+                        network_match = re.search(r'^network:.*?(?=^[a-z]|\Z)', content, re.MULTILINE | re.DOTALL)
+                        if network_match:
+                            network_config = network_match.group(0)
+                            console.print("[dim]Network config:[/]")
+                            for line in network_config.split('\n')[:20]:
+                                if line.strip():
+                                    console.print(f"  [dim]{line}[/]")
+                break
+    
+    # Recommendations
+    console.print("\n[bold]6. Recommendations[/]\n")
+    if not ip:
+        console.print("  [yellow]→[/] VM doesn't have an IP. Try:")
+        console.print(f"  [cyan]    1. Wait 2-3 more minutes for DHCP[/]")
+        console.print(f"  [cyan]    2. Check VM console: sudo virsh console {vm_name} --force[/]")
+        console.print(f"  [cyan]    3. Look for network/DHCP errors in console output[/]")
+        console.print(f"  [cyan]    4. Run full debug: ./conductor.py debug {vm_name}[/]")
+        console.print(f"  [cyan]    5. For Ubuntu 20.04/22.04, consider using Ubuntu 24.04 instead[/]")
 
 
 def show_cloudinit_logs(
