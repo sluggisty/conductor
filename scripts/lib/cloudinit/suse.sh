@@ -39,9 +39,9 @@ ssh_pwauth: true
 
 # Install required packages
 packages:
-  - python3
-  - python3-pip
-  - python3-virtualenv
+  - python39
+  - python39-pip
+  - python39-virtualenv
   - git
   - curl
   - vim
@@ -64,9 +64,57 @@ runcmd:
   - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin || echo "Trivy installation failed, continuing..."
   
   # Install snail-core from PyPI
-  - python3 -m venv /opt/snail-core/venv || python3 -m virtualenv /opt/snail-core/venv
+  # Note: snail-core requires Python >=3.9
+  # SUSE 15.2 only has Python 3.6, which is too old
+  # SUSE 15.5+ has Python 3.9+ and will work
+  - |
+    # Check Python version first
+    PYTHON_VERSION=\$(python3 --version 2>&1 | awk '{print \$2}' | cut -d. -f1,2)
+    PYTHON_MAJOR=\$(echo \$PYTHON_VERSION | cut -d. -f1)
+    PYTHON_MINOR=\$(echo \$PYTHON_VERSION | cut -d. -f2)
+    
+    # Determine which Python to use (prefer 3.9+)
+    if command -v python3.9 >/dev/null 2>&1; then
+      PYTHON_CMD=python3.9
+    elif command -v python3.10 >/dev/null 2>&1; then
+      PYTHON_CMD=python3.10
+    elif command -v python3.11 >/dev/null 2>&1; then
+      PYTHON_CMD=python3.11
+    elif command -v python3.12 >/dev/null 2>&1; then
+      PYTHON_CMD=python3.12
+    else
+      PYTHON_CMD=python3
+    fi
+    
+    PYTHON_ACTUAL_VERSION=\$(\$PYTHON_CMD --version 2>&1 | awk '{print \$2}')
+    PYTHON_ACTUAL_MAJOR=\$(echo \$PYTHON_ACTUAL_VERSION | cut -d. -f1)
+    PYTHON_ACTUAL_MINOR=\$(echo \$PYTHON_ACTUAL_VERSION | cut -d. -f2)
+    
+    echo "Detected Python version: \$PYTHON_ACTUAL_VERSION"
+    
+    # Check if Python version is sufficient (>=3.9)
+    if [ "\$PYTHON_ACTUAL_MAJOR" -lt 3 ] || ([ "\$PYTHON_ACTUAL_MAJOR" -eq 3 ] && [ "\$PYTHON_ACTUAL_MINOR" -lt 9 ]); then
+      echo "ERROR: snail-core requires Python >=3.9, but this system has Python \$PYTHON_ACTUAL_VERSION"
+      echo "SUSE ${version} (openSUSE Leap 15.2) only provides Python 3.6, which is too old."
+      echo "Recommendation: Use SUSE 15.5 or newer (has Python 3.9+)"
+      echo "Creating marker file to indicate installation failure"
+      mkdir -p /var/lib/snail-core
+      echo "Python version \$PYTHON_ACTUAL_VERSION is too old. Requires >=3.9" > /var/lib/snail-core/.install-failed
+      exit 0  # Don't fail cloud-init, just skip snail-core installation
+    fi
+    
+    echo "Using Python: \$PYTHON_CMD (\$PYTHON_ACTUAL_VERSION)"
+    \$PYTHON_CMD -m venv /opt/snail-core/venv || \$PYTHON_CMD -m virtualenv /opt/snail-core/venv || true
   - /opt/snail-core/venv/bin/pip install --upgrade pip
-  - /opt/snail-core/venv/bin/pip install snail-core
+  - |
+    # Install snail-core
+    if /opt/snail-core/venv/bin/pip install snail-core 2>&1; then
+      echo "snail-core installed successfully"
+    else
+      echo "ERROR: Failed to install snail-core"
+      mkdir -p /var/lib/snail-core
+      echo "pip install failed" > /var/lib/snail-core/.install-failed
+    fi
   
   # Create snail-core config directory
   - mkdir -p /etc/snail-core

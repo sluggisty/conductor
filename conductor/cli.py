@@ -11,6 +11,7 @@ from conductor.commands import (
     check_cloudinit_status,
     create_all_vms,
     create_vms,
+    debug_network,
     debug_vm,
     destroy_vms,
     list_versions,
@@ -233,5 +234,14 @@ def debug(vm_name: str):
 def wait_ssh(vm_name: str, timeout: int, interval: int):
     """Wait for SSH to become available on a VM."""
     wait_for_ssh(vm_name, timeout, interval)
+
+
+@cli.command("network-debug")
+@click.argument("vm_name", required=True)
+def network_debug_cmd(vm_name: str):
+    """Debug network configuration for a VM."""
+    from conductor.commands import debug_network
+    
+    debug_network(vm_name)
 
 
