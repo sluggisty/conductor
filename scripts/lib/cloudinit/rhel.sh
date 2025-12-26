@@ -82,7 +82,7 @@ runcmd:
       timeout: 30
       retries: 3
     auth:
-      api_key: ${SNAIL_API_KEY}
+      api_key: null
     collection:
       enabled_collectors: []
       disabled_collectors: []

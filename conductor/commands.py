@@ -813,20 +813,27 @@ def run_snail_on_vms(
     # The symlink is created at /usr/local/bin/snail by cloud-init
     # Use a simple command that tries both locations
     snail_binary = "snail"  # Try symlink first (in PATH)
-    snail_cmd = f"command -v {snail_binary} >/dev/null 2>&1 && {snail_binary} run || /opt/snail-core/venv/bin/snail run"
+    snail_run_cmd = f"command -v {snail_binary} >/dev/null 2>&1 && {snail_binary} run || /opt/snail-core/venv/bin/snail run"
     
     # Set environment variables for authentication
-    env_vars = []
+    # Use bash to export variables and run the command
+    # This ensures variables are properly set in the shell environment
+    import shlex
+    env_exports = []
     if upload_url:
-        env_vars.append(f"SNAIL_UPLOAD_URL='{upload_url}'")
+        # Properly quote the URL to handle special characters
+        env_exports.append(f"export SNAIL_UPLOAD_URL={shlex.quote(upload_url)}")
     
     # Add username and password for API key retrieval
-    env_vars.append("SNAIL_USERNAME='admin'")
-    env_vars.append("SNAIL_PASSWORD='changeme'")
+    env_exports.append("export SNAIL_USERNAME='admin'")
+    env_exports.append("export SNAIL_PASSWORD='changeme'")
     
-    if env_vars:
-        env_exports = " && ".join(f"export {var}" for var in env_vars)
-        snail_cmd = f"{env_exports} && {snail_cmd}"
+    # Build the complete command: export vars, then run snail
+    if env_exports:
+        env_setup = " && ".join(env_exports)
+        snail_cmd = f"bash -c {shlex.quote(env_setup + ' && ' + snail_run_cmd)}"
+    else:
+        snail_cmd = snail_run_cmd
 
     # Run on each VM (only those that are SSH-ready)
     results = {}
@@ -2151,6 +2158,166 @@ def debug_vm(
     console.print(f"  [cyan]     ./conductor.py destroy --vm {vm_name}[/]")
     console.print(f"  [cyan]     ./conductor.py create --specs ubuntu:24.04 --count 1[/]")
     console.print(f"  [dim]     (Ubuntu 24.04 has better cloud-init network support)[/]")
+
+
+def debug_snail_auth(vm_name: str) -> None:
+    """
+    Debug snail-core authentication and API key issues on a VM.
+    
+    Args:
+        vm_name: Name of the VM to debug
+    """
+    console.print(Panel.fit(
+        f"[bold cyan]Snail-Core Auth Debug: {vm_name}[/]",
+        border_style="cyan"
+    ))
+    
+    config = load_config()
+    vms_config = config.get("vms", {})
+    vm_user = vms_config.get("username", "conductor")
+    ssh_key_default = "~/.ssh/conductor-test-key"
+    ssh_key_path = os.path.expanduser(
+        config.get("host", {}).get("ssh_key_path", ssh_key_default)
+    )
+    
+    # Check VM state
+    vm_state = get_vm_state(vm_name)
+    if vm_state != "running":
+        console.print(f"[red]✗[/] VM is not running (state: {vm_state})")
+        return
+    
+    # Get VM IP
+    ip = get_vm_ip(vm_name)
+    if not ip:
+        console.print(f"[red]✗[/] Cannot get IP address for VM")
+        return
+    
+    console.print(f"[green]✓[/] VM is running at {ip}\n")
+    
+    # Check environment variables
+    console.print("[bold]1. Environment Variables[/]\n")
+    env_check_cmd = [
+        "ssh",
+        "-i", ssh_key_path,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=5",
+        "-o", "BatchMode=yes",
+        "-q",
+        f"{vm_user}@{ip}",
+        "echo 'SNAIL_UPLOAD_URL:' && echo $SNAIL_UPLOAD_URL && echo 'SNAIL_USERNAME:' && echo $SNAIL_USERNAME && echo 'SNAIL_PASSWORD:' && echo $SNAIL_PASSWORD && echo 'SNAIL_API_KEY:' && echo $SNAIL_API_KEY"
+    ]
+    env_result = run_command(env_check_cmd, capture=True, check=False, timeout=10)
+    if env_result.returncode == 0:
+        console.print(env_result.stdout)
+    else:
+        console.print(f"[yellow]⚠[/] Could not check environment variables")
+    
+    # Check config file
+    console.print("\n[bold]2. Snail-Core Config File[/]\n")
+    config_check_cmd = [
+        "ssh",
+        "-i", ssh_key_path,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=5",
+        "-o", "BatchMode=yes",
+        "-q",
+        f"{vm_user}@{ip}",
+        "cat /etc/snail-core/config.yaml 2>/dev/null || echo 'Config file not found'"
+    ]
+    config_result = run_command(config_check_cmd, capture=True, check=False, timeout=10)
+    if config_result.returncode == 0:
+        if "not found" not in config_result.stdout:
+            console.print(config_result.stdout)
+        else:
+            console.print("[yellow]⚠[/] Config file does not exist")
+    else:
+        console.print(f"[yellow]⚠[/] Could not read config file")
+    
+    # Try to manually get API key
+    console.print("\n[bold]3. Test API Key Retrieval[/]\n")
+    # First get the upload URL from environment or config
+    upload_url_cmd = [
+        "ssh",
+        "-i", ssh_key_path,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=5",
+        "-o", "BatchMode=yes",
+        "-q",
+        f"{vm_user}@{ip}",
+        "echo $SNAIL_UPLOAD_URL"
+    ]
+    upload_url_result = run_command(upload_url_cmd, capture=True, check=False, timeout=10)
+    upload_url = upload_url_result.stdout.strip() if upload_url_result.returncode == 0 else None
+    
+    if upload_url:
+        # Extract base URL
+        if "/ingest" in upload_url:
+            base_url = upload_url.rsplit("/ingest", 1)[0].rstrip("/")
+        else:
+            base_url = upload_url.rstrip("/")
+        
+        if not base_url.endswith("/api/v1"):
+            if base_url.endswith("/api"):
+                base_url = base_url + "/v1"
+            elif "/api" not in base_url:
+                base_url = base_url + "/api/v1"
+        
+        api_key_endpoint = f"{base_url}/auth/api-key"
+        console.print(f"[dim]API Key Endpoint:[/] {api_key_endpoint}")
+        
+        # Test the API key endpoint
+        test_cmd = [
+            "ssh",
+            "-i", ssh_key_path,
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=5",
+            "-o", "BatchMode=yes",
+            "-q",
+            f"{vm_user}@{ip}",
+            f"curl -s -X POST {api_key_endpoint} -H 'Content-Type: application/json' -d '{{\"username\":\"admin\",\"password\":\"changeme\"}}'"
+        ]
+        api_key_result = run_command(test_cmd, capture=True, check=False, timeout=15)
+        if api_key_result.returncode == 0:
+            console.print(f"[green]✓[/] API key endpoint response:")
+            console.print(api_key_result.stdout)
+        else:
+            console.print(f"[red]✗[/] Failed to get API key:")
+            console.print(api_key_result.stderr or api_key_result.stdout)
+    else:
+        console.print("[yellow]⚠[/] No upload URL found in environment")
+    
+    # Check if snail-core can see the API key
+    console.print("\n[bold]4. Snail-Core Status[/]\n")
+    status_cmd = [
+        "ssh",
+        "-i", ssh_key_path,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=5",
+        "-o", "BatchMode=yes",
+        "-q",
+        f"{vm_user}@{ip}",
+        "export SNAIL_UPLOAD_URL='$SNAIL_UPLOAD_URL' && export SNAIL_USERNAME='admin' && export SNAIL_PASSWORD='changeme' && /opt/snail-core/venv/bin/snail status 2>&1 || command -v snail >/dev/null 2>&1 && snail status 2>&1 || echo 'snail-core not found'"
+    ]
+    status_result = run_command(status_cmd, capture=True, check=False, timeout=30)
+    if status_result.returncode == 0:
+        console.print(status_result.stdout)
+    else:
+        console.print(f"[yellow]⚠[/] Could not run snail status:")
+        console.print(status_result.stderr or status_result.stdout)
+    
+    console.print("\n[bold]5. Manual Test Commands[/]\n")
+    console.print("[dim]You can manually SSH into the VM and run:[/]")
+    console.print(f"[cyan]  ssh -i {ssh_key_path} {vm_user}@{ip}[/]")
+    console.print("[dim]Then test:[/]")
+    console.print("[cyan]  export SNAIL_UPLOAD_URL='http://192.168.124.1:8080/api/v1/ingest'[/]")
+    console.print("[cyan]  export SNAIL_USERNAME='admin'[/]")
+    console.print("[cyan]  export SNAIL_PASSWORD='changeme'[/]")
+    console.print("[cyan]  /opt/snail-core/venv/bin/snail run[/]")
 
 
 def debug_network(vm_name: str) -> None:

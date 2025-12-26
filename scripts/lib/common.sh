@@ -23,7 +23,9 @@ VM_PASSWORD="${VM_PASSWORD:-conductortest123}"
 # Snail core configuration (API endpoint and key for uploads)
 # Note: snail-core is now installed via pip install snail-core
 SNAIL_API_ENDPOINT="${SNAIL_API_ENDPOINT:-http://192.168.124.1:8080/api/v1/ingest}"
-SNAIL_API_KEY="${SNAIL_API_KEY:-test-api-key-12345}"
+# Don't set a default API key - let snail-core fetch it automatically
+# Set to empty string to avoid "unbound variable" errors, but snail-core will fetch it
+SNAIL_API_KEY="${SNAIL_API_KEY:-}"
 
 # Distribution and versions to create
 # Format: "distro:version" or just "version" (defaults to fedora)
