@@ -12,6 +12,7 @@ from conductor.commands import (
     create_all_vms,
     create_vms,
     debug_network,
+    debug_snail_auth,
     debug_vm,
     destroy_vms,
     list_versions,
@@ -243,5 +244,12 @@ def network_debug_cmd(vm_name: str):
     from conductor.commands import debug_network
     
     debug_network(vm_name)
+
+
+@cli.command("debug-snail")
+@click.argument("vm_name", required=True)
+def debug_snail(vm_name: str):
+    """Debug snail-core authentication and API key issues on a VM."""
+    debug_snail_auth(vm_name)
 
 
